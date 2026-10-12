@@ -962,7 +962,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // Copy for Claude
+  // Copy notes
 
   // A copy closes the session: it moves to History and the next note starts a
   // fresh one. `historyId` re-copies a session from History instead.
