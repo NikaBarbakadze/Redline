@@ -4,10 +4,18 @@
 (() => {
   'use strict';
 
+  // SVG, XML and other non-HTML documents can't host the UI: their elements
+  // have no style or popover.
+  if (!(document.createElement('i') instanceof HTMLElement)) return;
+
   // A fresh copy (re-injected after an extension reload) replaces any orphan.
   document.dispatchEvent(new CustomEvent('redline:takeover'));
   const life = new AbortController();
-  const on = (target, type, fn, opts = {}) => target.addEventListener(type, fn, { ...opts, signal: life.signal });
+  // An orphan (Redline was reloaded or updated) shuts down on its first event
+  // instead of calling into the dead extension. Its timer can't be relied on:
+  // Chrome throttles and freezes timers in background tabs.
+  const on = (target, type, fn, opts = {}) =>
+    target.addEventListener(type, (e) => (chrome.runtime?.id ? fn(e) : teardown()), { ...opts, signal: life.signal });
   on(document, 'redline:takeover', () => teardown(), { once: true });
 
   const KEY = 'session';

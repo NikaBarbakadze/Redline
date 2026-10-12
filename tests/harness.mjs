@@ -21,7 +21,8 @@ export function serve(port = 4818) {
     const p = req.url.split('?')[0];
     const file = path.join(HERE, 'site', ROUTES[p] ?? (p.includes('.') ? p : 'other.html'));
     if (!fs.existsSync(file)) return res.writeHead(404).end();
-    res.writeHead(200, { 'content-type': 'text/html' }).end(fs.readFileSync(file));
+    const type = { '.svg': 'image/svg+xml', '.xml': 'application/xml' }[path.extname(file)] ?? 'text/html';
+    res.writeHead(200, { 'content-type': type }).end(fs.readFileSync(file));
   });
   return new Promise((r) => server.listen(port, () => r(server)));
 }
@@ -95,6 +96,16 @@ export const ui = (page, sel) => page.locator(`redline-ui >> ${sel}`);
 export const hasClass = (locator, cls) => locator.evaluate((el, c) => el.classList.contains(c), cls);
 export const badge = (sw) => sw.evaluate(() => chrome.action.getBadgeText({}));
 export const clip = (page) => page.evaluate(() => navigator.clipboard.readText());
+
+// Exceptions from Redline's content scripts, which run in isolated worlds that
+// Playwright's 'pageerror' doesn't see. Pass `frame` for an out-of-process iframe.
+export async function scriptErrors(context, target) {
+  const errors = [];
+  const cdp = await context.newCDPSession(target);
+  cdp.on('Runtime.exceptionThrown', ({ exceptionDetails: d }) => errors.push(d.exception?.description?.split('\n')[0] ?? d.text));
+  await cdp.send('Runtime.enable');
+  return errors;
+}
 
 const results = [];
 export function check(name, ok, detail = '') {

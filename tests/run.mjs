@@ -9,6 +9,8 @@ const suites = [
   ['pages.mjs'],
   ['iframes.mjs'],
   ['drag-frames.mjs'],
+  ['documents.mjs'],
+  ['reload.mjs'],
   ['history.mjs'],
   ['panel-sync.mjs'],
   ['paste-anywhere.mjs'],
