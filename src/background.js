@@ -160,6 +160,7 @@ function buildPrompt(session, paths) {
   items.forEach((item, i) => {
     out.push('', `## ${i + 1}`);
     if (!onePage) out.push(`Page: ${page(item)}`);
+    if (item.frameUrl) out.push(`Inside iframe: ${item.frameUrl}`);
     if (!oneViewport) out.push(`Viewport: ${viewport(item)}`);
     out.push(`Screenshot: ${paths[i] ?? '(missing; the screenshot could not be saved)'}`);
     const target = describeTarget(item);
@@ -211,11 +212,12 @@ async function copyText(text) {
 async function tellTab(tab, msg) {
   if (!tab?.id) return false;
   msg = { ...msg, target: 'page' };
+  const top = { frameId: 0 }; // child frames take their cues from the top frame
   const attempts = [
-    () => chrome.tabs.sendMessage(tab.id, msg),
+    () => chrome.tabs.sendMessage(tab.id, msg, top),
     async () => {
-      await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ['src/content.js'] });
-      return chrome.tabs.sendMessage(tab.id, msg);
+      await chrome.scripting.executeScript({ target: { tabId: tab.id, allFrames: true }, files: ['src/content.js'] });
+      return chrome.tabs.sendMessage(tab.id, msg, top);
     },
     // Extension pages (the welcome page) embed the UI directly.
     () => chrome.runtime.sendMessage({ ...msg, tabId: tab.id }),
@@ -258,6 +260,11 @@ const handlers = {
   capture: async (_, sender) => ({ dataUrl: await captureVisible(sender.tab.windowId) }),
   putImage: async ({ id, dataUrl }) => (await images.put(id, dataUrl), { ok: true }),
   getImages: ({ ids }) => images.getMany(ids),
+  // Top frame → every frame in its tab (start/stop picking, hide for the shot).
+  frames: async ({ payload }, sender) => {
+    await chrome.tabs.sendMessage(sender.tab.id, { ...payload, target: 'page' }).catch(() => {});
+    return { ok: true };
+  },
   gc: () => collectGarbage(),
   export: () => exportSession(),
   copyText: async ({ text }) => (await copyText(text), { ok: true }),

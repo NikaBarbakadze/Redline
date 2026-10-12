@@ -31,6 +31,7 @@ The welcome page that opens shows your shortcut and has a card to practice on.
 | <kbd>esc</kbd> | Cancel (twice if you've typed something) |
 
 - Hover states stay live while picking, so open menus, tooltips and modals (including native `<dialog>`s) can be captured.
+- Works inside iframes, including cross-origin ones like an embedded app in Shopify admin or the theme editor preview. The note records the iframe's URL (path only, so session tokens stay out) and the element path inside it.
 - Red numbered pins mark what you've already covered. Hover one to read the note, click it to edit.
 - The dock in the corner shows the count and has **Copy for Claude**. Click the count to review: edit notes inline, zoom screenshots, delete (with undo).
 - A session spans tabs and pages until you start a new one.
@@ -70,7 +71,7 @@ The format is built for **Claude Code**, which opens the screenshots from those 
 
 No build step and no dependencies.
 
-- `src/content.js`: all in-page UI (picker, composer, pins, dock, review sheet) in a shadow root. The host is a manual popover so it sits in the top layer above the page's own modals. When a modal `<dialog>` is open, it moves inside the dialog so it isn't inert. Idle cost on a page is one storage read and a pointer listener.
+- `src/content.js`: all in-page UI (picker, composer, pins, dock, review sheet) in a shadow root. It runs in every frame. Child frames pick on their own and post the result to their parent, which offsets it by the `<iframe>`'s content box and passes it up until the top frame takes the screenshot and opens the composer. Keys follow the pointer between frames. The host is a manual popover so it sits in the top layer above the page's own modals. When a modal `<dialog>` is open, it moves inside the dialog so it isn't inert. Idle cost on a page is one storage read and a pointer listener.
 - `src/background.js`: captures the tab, keeps screenshots in IndexedDB (session metadata lives in `chrome.storage`, so tabs don't sync megabytes of base64), writes the PNGs with the download bubble suppressed and history cleaned up, and builds the prompt.
 - `src/offscreen.*`: clipboard fallback for when the page can't write it.
 

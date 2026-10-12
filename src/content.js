@@ -14,6 +14,10 @@
   const MAX_EDGE = 2000; // px; longer screenshots are scaled down (Claude downsizes beyond this anyway)
   const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
   const IS_EXTENSION_PAGE = location.protocol === 'chrome-extension:';
+  // Redline runs in every frame. The top frame owns the composer, dock, sheet
+  // and the screenshot; child frames (e.g. a Shopify app inside the admin) only
+  // pick and show their own pins.
+  const IS_TOP = window === window.top;
 
   let session = null; // { id, folder, createdAt, items: [...] }
   let mode = 'idle'; // idle | picking | capturing | composing
@@ -39,6 +43,8 @@
   }
 
   const pageKey = () => location.origin + location.pathname + location.search;
+  // Frames are keyed without the query: embedded apps get fresh tokens on every load.
+  const frameKey = () => location.origin + location.pathname;
   const uid = () => crypto.randomUUID();
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   const frames = (n = 2) => new Promise((r) => (function tick(i) { i ? requestAnimationFrame(() => tick(i - 1)) : r(); })(n));
@@ -177,9 +183,11 @@
     for (const el of root.querySelectorAll('[data-ref]')) $[el.dataset.ref] = el;
     raise();
     wireUI();
-    send({ type: 'shortcut' })
-      .then(({ shortcut }) => setShortcut(shortcut))
-      .catch(() => {});
+    if (IS_TOP) {
+      send({ type: 'shortcut' })
+        .then(({ shortcut }) => setShortcut(shortcut))
+        .catch(() => {});
+    }
   }
 
   // An open modal <dialog> makes everything outside it inert, our top-layer
@@ -219,7 +227,9 @@
 
   // Keep keystrokes typed into Redline away from the page's own shortcuts.
   function isolate(rootNode) {
-    for (const type of ['keydown', 'keyup', 'keypress', 'input', 'paste', 'copy', 'cut', 'focusin', 'focusout', 'wheel']) {
+    const events = ['keydown', 'keyup', 'keypress', 'input', 'paste', 'copy', 'cut', 'focusin', 'focusout', 'wheel'];
+    const presses = ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu'];
+    for (const type of [...events, ...presses]) {
       rootNode.addEventListener(type, (e) => e.stopPropagation(), { passive: type === 'wheel' });
     }
   }
@@ -271,6 +281,7 @@
     save: () => commit({ next: false }),
     next: () => commit({ next: true }),
     discard: () => closeComposer(),
+    veil: () => dismissComposer(), // clicking the dimmed page counts as cancel
     delete: () => {
       if (!composer || composer.isNew) return;
       const id = composer.item.id;
@@ -292,7 +303,8 @@
       if (!item) return;
       if (item.url !== pageKey()) return window.open(item.url, '_blank');
       closeSheet();
-      showItem(item);
+      if (item.frameUrl) toFrames({ type: 'frame:show', id });
+      else showItem(item);
     },
     toast: () => toastAction?.(),
   };
@@ -313,7 +325,10 @@
     mode = 'picking';
     ensureUI();
     raise();
-    send({ type: 'ping' }).catch(() => {}); // wake the worker so the capture is instant
+    if (IS_TOP) {
+      send({ type: 'ping' }).catch(() => {}); // wake the worker so the capture is instant
+      toFrames({ type: 'frame:start' });
+    }
 
     Object.assign(pick, { base: null, el: null, trail: [], drag: null });
     pickAbort = new AbortController();
@@ -325,11 +340,14 @@
       addEventListener(type, swallow, opts);
     }
     addEventListener('keydown', onPickKey, opts);
+    addEventListener('pointerout', (e) => !e.relatedTarget && clearHover(), opts); // left this frame
     addEventListener('scroll', () => pick.el && !pick.drag && drawHighlight(pick.el), { capture: true, passive: true, signal: pickAbort.signal });
 
     setCursor(true);
-    $.hud.classList.add('on');
-    $.hud.classList.toggle('top', pointer.y > innerHeight - 110);
+    if (IS_TOP) {
+      $.hud.classList.add('on');
+      $.hud.classList.toggle('top', pointer.y > innerHeight - 110);
+    }
     pinsLayer?.classList.add('picking');
     render();
     if (pointer.x >= 0) hoverAt(pointer.x, pointer.y);
@@ -339,6 +357,7 @@
     if (mode !== 'picking') return;
     mode = 'idle';
     cleanupPicking();
+    if (IS_TOP) toFrames({ type: 'frame:stop' });
     render();
   }
 
@@ -407,10 +426,25 @@
   function hoverAt(x, y) {
     const el = elementAt(x, y);
     if (!el) return;
-    if (el === pick.base) return $.hl.classList.contains('on') || drawHighlight(pick.el);
-    pick.base = pick.el = el;
+    if (el === pick.base) return !pick.el || $.hl.classList.contains('on') || drawHighlight(pick.el);
+    pick.base = el;
     pick.trail = [];
+    if (childAgents.has(el)) {
+      // An iframe running Redline highlights its own content.
+      pick.el = null;
+      $.hl.classList.remove('on');
+      $.tag.classList.remove('on');
+      return;
+    }
+    pick.el = el;
     drawHighlight(el);
+    if (!IS_TOP) toParent({ type: 'enter' }); // so the parent knows where the pointer is
+  }
+
+  function clearHover() {
+    pick.base = null;
+    $.hl?.classList.remove('on');
+    $.tag?.classList.remove('on');
   }
 
   function onPickDown(e) {
@@ -432,28 +466,44 @@
       $.rg.classList.remove('on');
       $.hud.classList.remove('dragging');
       const r = rectFromPoints(d.x, d.y, e.clientX, e.clientY);
-      if (r.w >= 8 && r.h >= 8) return captureArea(r);
+      if (r.w >= 8 && r.h >= 8) return submit(areaPayload(r));
       return;
     }
-    if (pick.el) captureElement(pick.el);
+    if (pick.el) submit(elementPayload(pick.el));
   }
 
   function onPickKey(e) {
     if (ours(e)) return;
-    const k = e.key;
-    if (k === 'Escape') stopPicking();
-    else if (k === ' ') captureScreen();
-    else if (k === 'Enter' && pick.el) captureElement(pick.el);
-    else if (k === 'ArrowUp' && pick.el?.parentElement && pick.el.parentElement !== document.documentElement) {
-      pick.trail.push(pick.el);
-      pick.el = pick.el.parentElement;
-      drawHighlight(pick.el);
-    } else if (k === 'ArrowDown' && pick.trail.length) {
-      pick.el = pick.trail.pop();
-      drawHighlight(pick.el);
-    } else return;
+    if (!pickKey(e.key)) return;
     e.preventDefault();
     e.stopImmediatePropagation();
+  }
+
+  const NAV_KEYS = ['Enter', 'ArrowUp', 'ArrowDown'];
+
+  // Keys land in whichever frame has focus, which may not be the one under the
+  // pointer. Esc/Space are the top frame's; Enter/↑/↓ travel to the frame that
+  // is actually hovering something. `from` is the frame element a key came up
+  // from, so it's never bounced straight back.
+  function pickKey(k, { fromAbove = false, from = null } = {}) {
+    if (k === 'Escape') IS_TOP ? stopPicking() : toParent({ type: 'key', key: 'Escape' });
+    else if (k === ' ') IS_TOP ? captureScreen() : toParent({ type: 'key', key: ' ' });
+    else if (!NAV_KEYS.includes(k)) return false;
+    else if (pick.el) navKey(k);
+    else if (childAgents.has(pick.base) && pick.base !== from) forwardTo(pick.base, { type: 'key', key: k });
+    else if (!IS_TOP && !fromAbove) toParent({ type: 'key', key: k });
+    return true;
+  }
+
+  function navKey(k) {
+    if (k === 'Enter') return submit(elementPayload(pick.el));
+    if (k === 'ArrowUp' && pick.el.parentElement && pick.el.parentElement !== document.documentElement) {
+      pick.trail.push(pick.el);
+      pick.el = pick.el.parentElement;
+    } else if (k === 'ArrowDown' && pick.trail.length) {
+      pick.el = pick.trail.pop();
+    }
+    drawHighlight(pick.el);
   }
 
   function drawHighlight(el) {
@@ -522,37 +572,62 @@
     return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
   }
 
-  function captureElement(el) {
-    const r = el.getBoundingClientRect();
-    const rect = viewportRect(r);
-    const visible = intersect(rect);
-    if (visible.w < 2 || visible.h < 2) return;
+  // What was picked, in this frame's viewport coordinates. `pin` stays in this
+  // frame's document coordinates (pins render where the element lives).
+  function elementPayload(el) {
+    const rect = viewportRect(el.getBoundingClientRect());
     const fixed = isFixed(el);
-    capture({
+    return {
       kind: 'element',
-      spot: visible,
-      crop: contextCrop(visible),
-      ring: { ...rect, radius: parseFloat(getComputedStyle(el).borderTopLeftRadius) || 0 },
+      rect,
+      radius: parseFloat(getComputedStyle(el).borderTopLeftRadius) || 0,
       fixed,
-      rect: fixed ? rect : { ...rect, x: rect.x + scrollX, y: rect.y + scrollY },
+      pin: fixed ? rect : { ...rect, x: rect.x + scrollX, y: rect.y + scrollY },
       css: exactPath(el),
       target: { label: describe(el), path: readablePath(el), text: textOf(el) },
-    });
+    };
   }
 
-  function captureArea(r) {
+  function areaPayload(r) {
     const center = elementAt(r.x + r.w / 2, r.y + r.h / 2);
-    capture({
+    return {
       kind: 'area',
-      spot: r,
-      crop: r,
-      rect: { ...r, x: r.x + scrollX, y: r.y + scrollY },
+      rect: r,
+      pin: { ...r, x: r.x + scrollX, y: r.y + scrollY },
       target: center ? { label: describe(center), path: readablePath(center) } : null,
+    };
+  }
+
+  // Child frames hand the pick to the top frame, which takes the screenshot.
+  function submit(p) {
+    if (IS_TOP) return captureFrom(p);
+    mode = 'idle';
+    cleanupPicking();
+    toParent({ type: 'capture', ...p, frameUrl: frameKey(), bounds: viewportBounds() });
+  }
+
+  // Top frame: `rect` and `bounds` (the visible part of the frame chain) are in
+  // top-viewport coordinates by now.
+  function captureFrom(p) {
+    if (mode !== 'picking') return;
+    const visible = intersect(p.bounds ? overlap(p.rect, p.bounds) : p.rect);
+    if (visible.w < 2 || visible.h < 2) return;
+    const element = p.kind === 'element';
+    capture({
+      kind: p.kind,
+      spot: visible,
+      crop: element ? contextCrop(visible) : visible,
+      ring: element ? { ...p.rect, radius: p.radius } : null,
+      fixed: !!p.fixed,
+      rect: p.pin,
+      css: p.css ?? null,
+      target: p.target ?? null,
+      frameUrl: p.frameUrl ?? null,
     });
   }
 
   function captureScreen() {
-    const r = { x: 0, y: 0, w: innerWidth, h: innerHeight };
+    const r = viewportBounds();
     capture({ kind: 'screen', spot: r, crop: r, rect: { ...r, x: scrollX, y: scrollY } });
   }
 
@@ -562,19 +637,21 @@
     setHidden(true);
     let shot;
     try {
+      await toFrames({ type: 'frame:snap', hidden: true }); // child frames stop picking, hide their pins
       await frames(2); // let the hidden UI paint out
       shot = await send({ type: 'capture' });
     } catch (err) {
       mode = 'idle';
-      setHidden(false);
       render();
       return toast(`Couldn’t capture: ${err.message}`, { error: true });
+    } finally {
+      setHidden(false);
+      toFrames({ type: 'frame:snap', hidden: false });
     }
-    setHidden(false);
 
     let image;
     try {
-      image = await cropShot(shot.dataUrl, c.crop, c.kind === 'element' ? c.ring : null);
+      image = await cropShot(shot.dataUrl, c.crop, c.ring);
     } catch (err) {
       mode = 'idle';
       render();
@@ -593,6 +670,7 @@
       fixed: !!c.fixed,
       css: c.css ?? null,
       target: c.target ?? null,
+      frameUrl: c.frameUrl ?? null,
       createdAt: Date.now(),
     };
     openComposer({ item, isNew: true, image, spot: c.spot });
@@ -678,6 +756,7 @@
     $.spot.classList.toggle('screen', item.kind === 'screen');
     Object.assign($.spot.style, { left: `${spot.x}px`, top: `${spot.y}px`, width: `${spot.w}px`, height: `${spot.h}px`, transform: '' });
     $.spot.classList.add('on');
+    $.veil.classList.add('on');
     $.cmp.classList.add('on');
     placeComposer(true);
     $.input.focus({ preventScroll: true });
@@ -689,7 +768,7 @@
     addEventListener(
       'scroll',
       () => {
-        if (!composer || item.fixed) return;
+        if (!composer || (item.fixed && !item.frameUrl)) return;
         const dx = composer.scroll.x - scrollX;
         const dy = composer.scroll.y - scrollY;
         $.spot.style.transform = `translate(${dx}px, ${dy}px)`;
@@ -698,18 +777,6 @@
       { passive: true, signal: composerAbort.signal },
     );
     addEventListener('resize', () => placeComposer(), { signal: composerAbort.signal });
-    // Clicking the dimmed page outside the composer counts as "cancel".
-    addEventListener(
-      'pointerdown',
-      (e) => {
-        if (ours(e)) return;
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        swallowNextClick();
-        dismissComposer();
-      },
-      { capture: true, signal: composerAbort.signal },
-    );
   }
 
   function placeComposer(initial = false) {
@@ -769,6 +836,7 @@
   function closeComposer() {
     composerAbort?.abort();
     $.spot.classList.remove('on');
+    $.veil.classList.remove('on');
     $.cmp.classList.remove('on', 'armed');
     $.cmp.style.translate = '';
     composer = null;
@@ -838,7 +906,8 @@
 
   // Scroll a note's element into view and open it for editing.
   async function showItem(item) {
-    let r = livePinRect(item) ?? item.rect;
+    const live = livePinRect(item);
+    let r = live && !live.hidden ? live : item.rect;
     if (!item.fixed) {
       const top = r.y - scrollY;
       if (top < 0 || top + Math.min(r.h, innerHeight / 2) > innerHeight) {
@@ -847,6 +916,7 @@
       }
       r = { ...r, x: r.x - scrollX, y: r.y - scrollY };
     }
+    if (!IS_TOP) return toParent({ type: 'edit', id: item.id, rect: intersectOrSelf(r), bounds: viewportBounds() });
     openComposer({ item, isNew: false, image: await getImage(item.id), spot: intersectOrSelf(r) });
   }
 
@@ -1059,7 +1129,7 @@
 
   function render() {
     const items = session?.items ?? [];
-    if (host || items.length || mode !== 'idle' || sheetOpen) {
+    if (IS_TOP && (host || items.length || mode !== 'idle' || sheetOpen)) {
       ensureUI();
       const showDock = items.length > 0 && mode === 'idle' && !sheetOpen;
       $.dock.classList.toggle('on', showDock);
@@ -1100,6 +1170,9 @@
       const pin = e.target.closest('.p');
       if (!pin || mode !== 'idle') return;
       e.preventDefault();
+      // The editor opens over the pin (maybe from another frame); drop its tooltip.
+      pinsLayer.classList.add('quiet');
+      pin.addEventListener('pointerleave', () => pinsLayer.classList.remove('quiet'), { once: true });
       const item = session?.items.find((i) => i.id === pin.dataset.id);
       if (item) closeSheet(), showItem(item);
     });
@@ -1107,10 +1180,10 @@
   }
 
   function renderPins() {
-    const here = pageKey();
+    const here = IS_TOP ? pageKey() : frameKey();
     const mine = (session?.items ?? [])
       .map((item, i) => [item, i])
-      .filter(([item]) => item.url === here && item.kind !== 'screen');
+      .filter(([item]) => item.kind !== 'screen' && (IS_TOP ? !item.frameUrl && item.url === here : item.frameUrl === here));
     if (!mine.length && !pinsHost) return;
     ensurePins();
     const seen = new Set();
@@ -1173,11 +1246,142 @@
   }
 
   // -------------------------------------------------------------------------
+  // Frames. Child frames pick on their own and post the result to their parent,
+  // which translates it by the <iframe>'s offset and passes it on, hop by hop,
+  // until it reaches the top frame. Commands go back down through the worker.
+
+  const childAgents = new Set(); // <iframe>s whose document runs Redline
+
+  const viewportBounds = () => ({ x: 0, y: 0, w: innerWidth, h: innerHeight });
+  const shift = (r, o) => r && { ...r, x: r.x + o.x, y: r.y + o.y };
+
+  function overlap(a, b) {
+    const x = Math.max(a.x, b.x);
+    const y = Math.max(a.y, b.y);
+    return { x, y, w: Math.max(0, Math.min(a.x + a.w, b.x + b.w) - x), h: Math.max(0, Math.min(a.y + a.h, b.y + b.h) - y) };
+  }
+
+  function toParent(msg) {
+    try {
+      parent.postMessage({ redline: msg }, '*');
+    } catch {}
+  }
+
+  function toFrames(msg) {
+    if (!IS_TOP || (!childAgents.size && !document.querySelector('iframe, frame'))) return Promise.resolve();
+    return send({ type: 'frames', payload: msg }).catch(() => {});
+  }
+
+  function pingChildren() {
+    for (const f of document.querySelectorAll('iframe, frame')) {
+      try {
+        f.contentWindow?.postMessage({ redline: { type: 'ping' } }, '*');
+      } catch {}
+    }
+  }
+
+  function frameFor(win) {
+    const search = (scope) => {
+      for (const f of scope.querySelectorAll('iframe, frame')) if (f.contentWindow === win) return f;
+      for (const el of scope.querySelectorAll('*')) {
+        const hit = el.shadowRoot && search(el.shadowRoot);
+        if (hit) return hit;
+      }
+      return null;
+    };
+    return search(document);
+  }
+
+  // The <iframe>'s content box in this frame's viewport.
+  function frameBox(f) {
+    const r = f.getBoundingClientRect();
+    const cs = getComputedStyle(f);
+    const pl = parseFloat(cs.paddingLeft) || 0;
+    const pt = parseFloat(cs.paddingTop) || 0;
+    return {
+      x: r.left + f.clientLeft + pl,
+      y: r.top + f.clientTop + pt,
+      w: f.clientWidth - pl - (parseFloat(cs.paddingRight) || 0),
+      h: f.clientHeight - pt - (parseFloat(cs.paddingBottom) || 0),
+    };
+  }
+
+  function forwardTo(frame, msg) {
+    try {
+      frame.contentWindow.postMessage({ redline: msg }, '*');
+    } catch {}
+  }
+
+  function onFrameMessage(e) {
+    const m = e.data?.redline;
+    if (!m || typeof m !== 'object' || !e.source || e.source === window) return;
+    if (!IS_TOP && e.source === parent) return fromParent(m);
+    const frame = frameFor(e.source);
+    if (!frame) return;
+    if (m.type === 'hello') return void childAgents.add(frame);
+    if (m.type === 'enter') {
+      if (mode !== 'picking') return;
+      childAgents.add(frame);
+      if (pick.base !== frame) Object.assign(pick, { base: frame, el: null, trail: [] });
+      $.hl?.classList.remove('on');
+      $.tag?.classList.remove('on');
+      if (!IS_TOP) toParent({ type: 'enter' });
+      return;
+    }
+    if (m.type === 'key' && mode === 'picking' && (IS_TOP || (NAV_KEYS.includes(m.key) && pick.el))) {
+      return void pickKey(m.key, { from: frame });
+    }
+    const box = frameBox(frame);
+    const up = { ...m, rect: shift(m.rect, box), bounds: m.bounds && overlap(shift(m.bounds, box), box) };
+    if (IS_TOP) fromChild(up);
+    else toParent(up);
+  }
+
+  function fromParent(m) {
+    if (m.type === 'ping') toParent({ type: 'hello' });
+    else if (m.type === 'key' && mode === 'picking') pickKey(m.key, { fromAbove: true });
+  }
+
+  function fromChild(m) {
+    if (m.type === 'capture') captureFrom(m);
+    else if (m.type === 'edit' && mode === 'idle') editFromFrame(m);
+  }
+
+  async function editFromFrame(m) {
+    const item = session?.items.find((i) => i.id === m.id);
+    if (!item) return;
+    closeSheet();
+    openComposer({ item, isNew: false, image: await getImage(item.id), spot: intersectOrSelf(overlap(m.rect, m.bounds)) });
+  }
+
+  function onFrameCommand(msg) {
+    switch (msg.type) {
+      case 'frame:start':
+        return startPicking();
+      case 'frame:stop':
+        return stopPicking();
+      case 'frame:snap':
+        if (msg.hidden) stopPicking();
+        return setHidden(msg.hidden);
+      case 'frame:show': {
+        const item = session?.items.find((i) => i.id === msg.id);
+        if (item?.frameUrl === frameKey()) showItem(item);
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
   // Lifecycle
 
   function onMessage(msg, _sender, sendResponse) {
     if (msg?.target !== 'page') return false;
     if (IS_EXTENSION_PAGE && msg.tabId != null && myTabId != null && msg.tabId !== myTabId) return false;
+    if (msg.type?.startsWith('frame:')) {
+      if (IS_TOP) return false;
+      onFrameCommand(msg);
+      sendResponse({ ok: true });
+      return false;
+    }
     switch (msg.type) {
       case 'toggle':
         if (mode === 'picking') stopPicking();
@@ -1214,14 +1418,19 @@
   }
 
   on(window, 'pointermove', (e) => ((pointer.x = e.clientX), (pointer.y = e.clientY)), { passive: true, capture: true });
+  on(window, 'pointerout', (e) => !e.relatedTarget && (pointer.x = pointer.y = -1), { passive: true, capture: true });
+  on(window, 'message', onFrameMessage);
+  if (!IS_TOP) toParent({ type: 'hello' });
+  pingChildren();
   on(window, 'resize', () => pinEls.size && renderPins(), { passive: true });
 
   // SPA navigation and late layout shifts move things around; re-check now and then.
-  let lastUrl = pageKey();
+  const here = IS_TOP ? pageKey : frameKey;
+  let lastUrl = here();
   const watch = setInterval(() => {
     if (!chrome.runtime?.id) return teardown();
-    if (pageKey() !== lastUrl) {
-      lastUrl = pageKey();
+    if (here() !== lastUrl) {
+      lastUrl = here();
       if (mode === 'composing') closeComposer();
       renderPins();
     } else if (pinEls.size) renderPins();
@@ -1264,6 +1473,7 @@
     <div class="tag" data-ref="tag"><span data-ref="tagName"></span><span class="d" data-ref="tagSize"></span></div>
     <div class="rg" data-ref="rg"><span class="rg-size" data-ref="rgSize"></span></div>
     <div class="spot" data-ref="spot"></div>
+    <div class="veil" data-ref="veil" data-act="veil"></div>
 
     <div class="hud glass" data-ref="hud">
       <span class="i"><kbd>Click</kbd> element</span>
@@ -1450,6 +1660,8 @@
   }
   .spot.screen { box-shadow: inset 0 0 0 3px var(--blue); border-radius: 0; }
   .spot.on { opacity: 1; }
+  .veil { position: fixed; inset: 0; pointer-events: none; }
+  .veil.on { pointer-events: auto; }
   .cmp {
     position: fixed; left: 0; top: 0; width: 336px; max-width: calc(100vw - 24px); border-radius: 14px; overflow: hidden;
     display: flex; flex-direction: column; background: var(--solid);
@@ -1579,7 +1791,7 @@
     box-shadow: 0 8px 28px rgba(0,0,0,.25); pointer-events: none; opacity: 0; transform: translateX(-4px); transition: opacity .15s, transform .2s;
     display: -webkit-box; -webkit-line-clamp: 6; -webkit-box-orient: vertical; overflow: hidden;
   }
-  .layer.busy .tip { display: none; }
+  .layer.busy .tip, .layer.quiet .tip { display: none; }
   .p.flip .tip { left: auto; right: 30px; transform: translateX(4px); }
   .p:hover .tip { opacity: 1; transform: none; }
   .tip:empty { display: none; }
