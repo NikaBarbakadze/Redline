@@ -1,62 +1,94 @@
-# Redline
+<p align="center">
+  <img src="icons/128.png" width="88" height="88" alt="">
+</p>
 
-A Chrome extension for QA passes with Claude. Point at something on the page, say what should change, move on. When you're done, one click copies the whole session as a single prompt that pairs every screenshot with its note.
+<h1 align="center">Redline</h1>
 
-![Composer](docs/composer.png)
+<p align="center">
+  <strong>Point at anything on a web page, say what should change, and hand the whole batch to your coding agent.</strong>
+</p>
 
-## Why
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/Chrome-123%2B-4285F4?logo=googlechrome&logoColor=white" alt="Chrome 123+">
+  <img src="https://img.shields.io/badge/Manifest-V3-34A853" alt="Manifest V3">
+  <img src="https://img.shields.io/badge/dependencies-none-brightgreen" alt="No dependencies">
+</p>
 
-The old loop was: screenshot → paste into Claude → type → back to the browser → repeat, with nothing tying each note to its image. Redline keeps you in the browser. Notes sit right next to what they're about, and the export is structured so Claude can't mix them up.
+<p align="center">
+  <img src="docs/composer.png" width="760" alt="Redline's note composer next to a picked button">
+</p>
+
+Redline is a Chrome extension for UI review. Click an element (or drag an area), type what should change, and move on to the next thing. When you're done, one click copies the whole session as a single, structured prompt: every note paired with its screenshot and the element's location in the DOM. Paste it into Claude Code, Codex, Cursor or a web chat and the agent knows exactly what you meant.
+
+It replaces the usual loop of screenshot → switch to the chat → paste → describe → switch back, where nothing ties a note to its image.
+
+## Features
+
+- **Point and note.** Hover highlights elements the way DevTools does. Click to capture one, drag for an area, <kbd>Space</kbd> for the whole screen. The note field opens right beside what you picked.
+- **Screenshots with context.** Element shots include some surrounding page, with the target outlined in red so it's clear what you meant.
+- **Prompts agents can act on.** Every note carries the page, viewport and a readable element path that stops at the nearest id. On Shopify that's the section, so the agent can go straight to the right file.
+- **Paste anywhere.** Coding agents get local file paths. In web chats, <kbd>⌘</kbd><kbd>V</kbd> attaches the screenshots themselves, each numbered to match its note.
+- **Hover states stay live.** Open menus, tooltips and modals (native `<dialog>` included) can be captured while they're open.
+- **Works inside iframes**, including cross-origin ones like embedded apps in Shopify admin or the theme editor preview.
+- **No duplicates.** While you pick, anything you've already noted turns red and shows its note.
+- **Sessions and History.** A session can span tabs and pages. Copying archives it, and your last 50 sessions stay in History to copy again or continue.
+- **Private by design.** No accounts, no servers, no analytics. Nothing leaves your machine.
+
+<p align="center">
+  <img src="docs/sheet.png" width="300" alt="Notes panel">&nbsp;&nbsp;
+  <img src="docs/history.png" width="300" alt="History">
+</p>
 
 ## Install
 
-1. `chrome://extensions` → turn on **Developer mode**.
-2. **Load unpacked** → pick this folder.
-3. Pin Redline from the puzzle-piece menu.
+Redline isn't on the Chrome Web Store yet. To install it from source:
 
-The welcome page that opens shows your shortcut and has a card to practice on.
+1. Clone or download this repository.
+2. Open `chrome://extensions` and turn on **Developer mode**.
+3. Click **Load unpacked** and select the repository folder.
+4. Pin Redline from the puzzle-piece menu.
 
-## Use
+A welcome page opens with your shortcut and a card to practice on. If <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> doesn't trigger Redline, another extension probably owns it. Pick a different one at `chrome://extensions/shortcuts`.
 
-| | |
+## Usage
+
+Press <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> or click the toolbar icon, pick something, write a note and press <kbd>↵</kbd>. Repeat. When you're done, click **Copy notes** in the dock and paste.
+
+| Key | Action |
 |---|---|
 | <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> or the toolbar icon | Start capturing |
 | Click | Capture the highlighted element |
 | Drag | Capture an area |
 | <kbd>Space</kbd> | Capture the whole visible screen |
-| <kbd>↑</kbd> / <kbd>↓</kbd> | Select the parent / back to the child |
+| <kbd>↑</kbd> / <kbd>↓</kbd> | Select the parent element / go back to the child |
 | <kbd>↵</kbd> | Save the note |
 | <kbd>⌘</kbd><kbd>↵</kbd> | Save and capture the next one |
 | <kbd>⇧</kbd><kbd>↵</kbd> | New line |
 | <kbd>esc</kbd> | Cancel (twice if you've typed something) |
 | <kbd>esc</kbd> with nothing open | Hide the dock until your next capture |
 
-- Hover states stay live while picking, so open menus, tooltips and modals (including native `<dialog>`s) can be captured.
-- Works inside iframes, including cross-origin ones like an embedded app in Shopify admin or the theme editor preview. The note records the iframe's URL (path only, so session tokens stay out) and the element path inside it.
-- Nothing is drawn on the page between captures. While picking, an element you've already noted turns red and its label shows the note's number and text, so you don't capture it twice. The match is the element itself, not a saved position, so it never points at the wrong thing. To find a note's element again, click **This page** on its card in the panel.
-- The dock in the corner shows the count and has **Copy notes**. Click the count to open the notes panel: edit notes inline, zoom screenshots, copy a single screenshot, delete (with undo). The panel is one panel across tabs: it follows you to the next tab, and closing it anywhere closes it everywhere. Copying closes it.
-- A session spans tabs and pages. **Copying closes it**: it moves to History and your next note starts again at 1, so a forgotten "new session" can't mix batches. Copied too early? **Keep adding** in the toast reopens it.
-- **History** (the second tab in the panel, or right-click the icon → History) keeps your last 50 sessions. Open one to see its notes and screenshots, copy it again (same file paths), or **Continue** it to add more notes. Anything in progress is set aside into History first, so nothing is lost.
+On Windows and Linux, use <kbd>Ctrl</kbd> wherever you see <kbd>⌘</kbd>.
 
-Right-click the toolbar icon for Review / History / Copy / New session / Change shortcut. If <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> doesn't fire, another extension probably owns it; set one at `chrome://extensions/shortcuts`.
+**The dock** in the corner shows how many notes you have and has **Copy notes**. Click the count to open the **notes panel**, where you can edit notes inline, zoom screenshots, copy a single screenshot, jump back to a note's element on the page, or delete a note (with undo). The panel follows you across tabs.
 
-<p><img src="docs/sheet.png" alt="Notes panel" width="300"> <img src="docs/history.png" alt="History" width="300"></p>
+**Sessions.** Copying closes the session. It moves to History and your next note starts again at 1, so batches never mix. Copied too early? **Keep adding** in the confirmation toast reopens it. **History** (the second tab in the panel, or right-click the toolbar icon) keeps your last 50 sessions. Open one to copy it again or **Continue** it.
 
 ## What gets copied
 
-Screenshots are written to `~/Downloads/Redline/<session>/01.png, 02.png, …` and the clipboard gets:
+Screenshots are saved to `~/Downloads/Redline/<session>/01.png, 02.png, …` and the clipboard gets a prompt like this:
 
-```
+```markdown
 # UI changes (2 notes)
 
-I took these while reviewing the page in the browser. Each note pairs a screenshot with the change I want. …
+I took these while reviewing the page in the browser. Each note pairs a screenshot with the change I want. The screenshots are local PNG files; open each one before making its change. In element screenshots the target is outlined in red.
 
-Page: Two Tier Lander (https://hooksandneedles.com/pages/two-tier)
+Page: Spring Collection (https://shop.example.com/pages/spring)
 Viewport: 1440×900
 
 ## 1
 Screenshot: /Users/you/Downloads/Redline/2026-10-12_14-32-05/01.png
-Element: `section#shopify-section-template--1234__hero > div.hero__content > a#cta` "Get my free box"
+Element: `section#shopify-section-template--1234__hero > div.hero__content > a#cta` "Shop the collection"
 Change: Make the button bigger and use our brand green.
 
 ## 2
@@ -65,36 +97,67 @@ Area: a dragged region centered on `section.grid > div.card.product-card`
 Change: Cards feel cramped. Add more padding.
 ```
 
-Element screenshots include some surrounding context with the target outlined in red. The element path stops at the nearest id, which on Shopify is usually the section, so Claude can find the right file.
-
-The format is built for **Claude Code**, which opens the screenshots from those paths. Page, viewport and element details are only repeated per note when they differ.
+Page, viewport and iframe details are only repeated per note when they differ.
 
 ### Where to paste
 
-- **Claude Code, Codex (CLI or app), Cursor and other coding agents:** paste as is. They open the screenshots from the paths.
-- **Any web chat** (claude.ai, including project chats and existing conversations, ChatGPT, Codex on the web…): <kbd>⌘</kbd><kbd>V</kbd> attaches every screenshot, numbered in its corner, and swaps the paths for "attached image N". Redline recognises its own text on the clipboard, so ordinary pastes are untouched. **Paste and Match Style** (<kbd>⌥</kbd><kbd>⇧</kbd><kbd>⌘</kbd><kbd>V</kbd>) pastes just the text, and so does any page that doesn't take images.
-- **Desktop chat apps** (Claude, ChatGPT): **Show files** in the "Copied" toast opens the screenshots in Finder to drag in, or copy a single screenshot from its card in the panel.
+| Destination | What happens |
+|---|---|
+| **Claude Code, Codex, Cursor** and other coding agents | Paste as is. They open the screenshots from the file paths. |
+| **Web chats** (claude.ai, ChatGPT, Codex on the web, …) | <kbd>⌘</kbd><kbd>V</kbd> attaches every screenshot, numbered in its corner, and rewords the prompt to "attached image N". Redline only does this for text it copied itself, so your other pastes are untouched. |
+| **Desktop chat apps** | **Show files** in the "Copied" toast opens the screenshots in Finder so you can drag them in. You can also copy a single screenshot from its card in the panel. |
+
+To paste just the text, use **Paste and Match Style** (<kbd>⌥</kbd><kbd>⇧</kbd><kbd>⌘</kbd><kbd>V</kbd>, or <kbd>Ctrl</kbd><kbd>Shift</kbd><kbd>V</kbd>).
+
+## Privacy and permissions
+
+Redline has no backend and makes no network requests. Notes and screenshots stay in the extension's local storage, and the only files it writes are the screenshots it saves to your Downloads folder when you copy.
+
+| Permission | Why |
+|---|---|
+| Access to all sites, `activeTab`, `scripting` | Run the picker on whatever page you're reviewing, including inside its iframes, and capture the visible tab. `scripting` adds Redline to tabs that were already open when it was installed or updated. |
+| `storage`, `unlimitedStorage` | Keep the current session, and keep screenshots and History in IndexedDB without hitting the default quota. |
+| `downloads`, `downloads.ui` | Save the screenshots as PNGs without the download bubble, then clear their rows from the downloads list. |
+| `clipboardWrite`, `offscreen` | Copy the prompt, with an offscreen document as a fallback when the page can't write to the clipboard. |
+| `contextMenus` | The right-click menu on the toolbar icon (Review, History, Copy, New session, Change shortcut). |
 
 ## How it works
 
-No build step and no dependencies.
+No build step and no runtime dependencies: plain JavaScript on Manifest V3.
 
-- `src/content.js`: all in-page UI (picker, composer, dock, review sheet) in a shadow root. It runs in every frame. Child frames pick on their own and post the result to their parent, which offsets it by the `<iframe>`'s content box and passes it up until the top frame takes the screenshot and opens the composer. Keys follow the pointer between frames. The host is a manual popover so it sits in the top layer above the page's own modals. When a modal `<dialog>` is open, it moves inside the dialog so it isn't inert. Idle cost on a page is one storage read and a pointer listener.
-- `src/background.js`: captures the tab, builds the numbered attachments for web-chat pastes, keeps screenshots, thumbnails and session History in IndexedDB (only the active session lives in `chrome.storage`, so tabs stay in sync without passing megabytes of base64 around), writes the PNGs with the download bubble suppressed and the downloads list cleaned up, and builds the prompt.
-- `src/offscreen.*`: clipboard fallback for when the page can't write it.
-
-Nothing leaves your machine.
+| File | Role |
+|---|---|
+| `src/content.js` | All in-page UI (picker, composer, dock, notes panel) in a shadow root, so page styles can't leak in. It runs in every frame: child frames pick on their own and post the result up, offset by each `<iframe>`'s content box, until the top frame takes the screenshot, crops it and outlines the target. The UI is a manual popover, so it sits in the top layer above the page's own modals. When a modal `<dialog>` is open, Redline moves inside it so it isn't made inert. While idle, it costs one storage read and a pointer listener. |
+| `src/background.js` | The service worker. Captures the tab, stores screenshots and History in IndexedDB (only the active session lives in `chrome.storage`, so tabs stay in sync without passing megabytes of base64 around), writes the PNGs, builds the prompt and numbers the images for web-chat pastes. |
+| `src/offscreen.*` | Clipboard fallback. |
+| `welcome.html` | First-run page with a practice card. |
 
 ## Development
 
-Reload the extension at `chrome://extensions` after editing, then refresh open tabs.
+```sh
+git clone https://github.com/NikaBarbakadze/Redline.git
+```
 
-End-to-end tests run a real Chromium with the extension loaded, driven by Playwright, against mock pages in `tests/site` (a store page, a Shopify-admin-like page with a cross-origin app iframe, mock chat boxes):
+Load the folder as an unpacked extension (see [Install](#install)). After editing, click reload on Redline's card at `chrome://extensions` and refresh any open tabs.
+
+### Tests
+
+End-to-end suites run a real Chromium with the extension loaded, driven by Playwright. They run against mock pages in `tests/site`: a storefront, a Shopify-admin-style page with a cross-origin app iframe, and mock chat composers.
 
 ```sh
 cd tests
-npm install   # playwright-core; uses Playwright's Chromium (npx playwright-core install chromium if missing)
-npm test      # all suites; or run one, e.g. node iframes.mjs
+npm install                              # installs playwright-core
+npx playwright-core install chromium     # first run only, if Chromium is missing
+npm test                                 # every suite (a few minutes)
+node pages.mjs                           # or a single suite
 ```
 
 `npm run icons` (from `tests/`) re-renders the icons from `tools/make-icons.mjs`.
+
+## Contributing
+
+Issues and pull requests are welcome. For anything bigger than a small fix, please open an issue first to talk it through. Before sending a change, run `npm test` in `tests/`. If you fix a bug or change behavior, add a check to the relevant suite.
+
+## License
+
+[MIT](LICENSE)
