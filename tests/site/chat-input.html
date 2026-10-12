@@ -1,0 +1,3 @@
+<!doctype html><html><head><meta charset="utf-8"><title>Chat (upload input only)</title></head>
+<body style="font-family:-apple-system;padding:40px"><form id="f"><textarea id="msg" rows="10" cols="80"></textarea><input type="file" id="up" multiple hidden></form>
+<script>window.received=[];document.getElementById('up').addEventListener('change',e=>{for(const f of e.target.files)window.received.push(f.name)});</script></body></html>

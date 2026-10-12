@@ -34,13 +34,13 @@ The welcome page that opens shows your shortcut and has a card to practice on.
 - Hover states stay live while picking, so open menus, tooltips and modals (including native `<dialog>`s) can be captured.
 - Works inside iframes, including cross-origin ones like an embedded app in Shopify admin or the theme editor preview. The note records the iframe's URL (path only, so session tokens stay out) and the element path inside it.
 - Red numbered pins mark what you've already covered. Hover one to read the note, click it to edit.
-- The dock in the corner shows the count and has **Copy notes**. Click the count to review: edit notes inline, zoom screenshots, delete (with undo).
+- The dock in the corner shows the count and has **Copy notes**. Click the count to open the notes panel: edit notes inline, zoom screenshots, copy a single screenshot, delete (with undo). The panel is one panel across tabs: it follows you to the next tab, and closing it anywhere closes it everywhere. Copying closes it.
 - A session spans tabs and pages. **Copying closes it**: it moves to History and your next note starts again at 1, so a forgotten "new session" can't mix batches. Copied too early? **Keep adding** in the toast reopens it.
 - **History** (the second tab in the panel, or right-click the icon → History) keeps your last 50 sessions. Open one to see its notes and screenshots, copy it again (same file paths), or **Continue** it to add more notes. Anything in progress is set aside into History first, so nothing is lost.
 
 Right-click the toolbar icon for Review / History / Copy / New session / Change shortcut. If <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> doesn't fire, another extension probably owns it; set one at `chrome://extensions/shortcuts`.
 
-![Review sheet](docs/sheet.png)
+<p><img src="docs/sheet.png" alt="Notes panel" width="300"> <img src="docs/history.png" alt="History" width="300"></p>
 
 ## What gets copied
 
@@ -84,3 +84,17 @@ No build step and no dependencies.
 - `src/offscreen.*`: clipboard fallback for when the page can't write it.
 
 Nothing leaves your machine.
+
+## Development
+
+Reload the extension at `chrome://extensions` after editing, then refresh open tabs.
+
+End-to-end tests run a real Chromium with the extension loaded, driven by Playwright, against mock pages in `tests/site` (a store page, a Shopify-admin-like page with a cross-origin app iframe, mock chat boxes):
+
+```sh
+cd tests
+npm install   # playwright-core; uses Playwright's Chromium (npx playwright-core install chromium if missing)
+npm test      # all suites; or run one, e.g. node iframes.mjs
+```
+
+`npm run icons` (from `tests/`) re-renders the icons from `tools/make-icons.mjs`.

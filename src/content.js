@@ -75,8 +75,10 @@
   }
 
   function onStorage(changes, area) {
-    if ('lastCopy' in changes && area === 'local') lastCopy = changes.lastCopy.newValue ?? null;
-    if (area !== 'local' || !(KEY in changes || 'uiHidden' in changes)) return;
+    if (area !== 'local') return;
+    if ('lastCopy' in changes) lastCopy = changes.lastCopy.newValue ?? null;
+    if ('panel' in changes) syncPanel(changes.panel.newValue);
+    if (!(KEY in changes || 'uiHidden' in changes)) return;
     if (KEY in changes) session = changes[KEY].newValue ?? null;
     if ('uiHidden' in changes) uiHidden = !!changes.uiHidden.newValue;
     render();
@@ -981,6 +983,7 @@
         b.classList.add('done');
         setTimeout(() => b.classList.remove('done'), 1600);
       }
+      closeSheet(); // copied: get out of the way, as the dock does
       const showFiles = (id) => ({ label: 'Show files', run: () => revealFiles(id) });
       if (historyId) {
         if (entry?.id === historyId) entry.copiedAt = entry.archivedAt = Date.now();
@@ -1176,7 +1179,10 @@
   // -------------------------------------------------------------------------
   // Review sheet
 
-  function openSheet(view = 'current') {
+  // The panel is open or closed in every tab at once: it follows you to the
+  // next tab, and closing it anywhere closes it everywhere. `sync: false` is
+  // for changes that came from another tab.
+  function openSheet(view = 'current', { sync = true } = {}) {
     if (mode === 'picking') stopPicking();
     if (mode !== 'idle') return;
     sheetOpen = true;
@@ -1186,7 +1192,30 @@
     raise();
     render();
     refreshHistory();
-    requestAnimationFrame(() => $.sheet.classList.add('on'));
+    if (sync) {
+      requestAnimationFrame(() => $.sheet.classList.add('on'));
+      setPanel({ open: true, view });
+    } else {
+      // Followed you here from another tab: already in place, no slide-in.
+      $.sheet.style.transition = 'none';
+      $.sheet.classList.add('on');
+      void $.sheet.offsetWidth;
+      $.sheet.style.transition = '';
+    }
+  }
+
+  function setPanel(panel) {
+    if (IS_TOP) chrome.storage.local.set({ panel }).catch(() => {});
+  }
+
+  // Background tabs skip opening (no need to build it in thirty tabs); they
+  // pick the state up when you switch to them. Closing is applied everywhere.
+  function syncPanel(panel) {
+    if (!IS_TOP) return;
+    if (!panel?.open) return closeSheet({ sync: false });
+    if (document.visibilityState === 'hidden') return;
+    if (!sheetOpen) openSheet(panel.view ?? 'current', { sync: false });
+    else if (panel.view && panel.view !== sheetView && sheetView !== 'entry') setSheetView(panel.view, { sync: false });
   }
 
   // -------------------------------------------------------------------------
@@ -1286,18 +1315,20 @@
     toast('Notes hidden. They come back on your next capture.', { action: 'Show', onAction: () => setUiHidden(false) });
   }
 
-  function closeSheet() {
+  function closeSheet({ sync = true } = {}) {
     if (!sheetOpen) return;
     sheetOpen = false;
     $.sheet.classList.remove('on');
     root.activeElement?.blur();
     render();
+    if (sync) setPanel({ open: false });
   }
 
-  function setSheetView(view) {
+  function setSheetView(view, { sync = true } = {}) {
     const back = sheetView === 'entry' && view === 'history';
     const forward = view === 'entry';
     sheetView = view;
+    if (sync && view !== 'entry') setPanel({ open: true, view }); // a History detail stays in this tab
     if (view !== 'entry') {
       entry = null;
       $.entryList.dataset.id = '';
@@ -1904,6 +1935,11 @@
   on(window, 'pointermove', (e) => ((pointer.x = e.clientX), (pointer.y = e.clientY)), { passive: true, capture: true });
   on(window, 'pointerout', (e) => !e.relatedTarget && (pointer.x = pointer.y = -1), { passive: true, capture: true });
   on(window, 'message', onFrameMessage);
+  on(document, 'visibilitychange', () => {
+    if (IS_TOP && document.visibilityState === 'visible') {
+      chrome.storage.local.get('panel').then(({ panel }) => syncPanel(panel)).catch(() => {});
+    }
+  });
   if (!IS_TOP) toParent({ type: 'hello' });
   on(window, 'resize', () => pinEls.size && renderPins(), { passive: true });
 
@@ -1928,11 +1964,12 @@
     document.readyState === 'loading' ? on(document, 'DOMContentLoaded', resolve, { once: true }) : resolve(),
   );
   chrome.storage.local.get('lastCopy').then((stored) => (lastCopy = stored.lastCopy ?? null));
-  Promise.all([chrome.storage.local.get([KEY, 'uiHidden']), domReady]).then(([stored]) => {
+  Promise.all([chrome.storage.local.get([KEY, 'uiHidden', 'panel']), domReady]).then(([stored]) => {
     session = stored[KEY] ?? null;
     uiHidden = !!stored.uiHidden;
     pingChildren();
     render();
+    if (stored.panel?.open) syncPanel(stored.panel); // the panel follows you to new pages too
   });
 
   // Exposed for pages that host Redline directly (the welcome page).

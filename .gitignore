@@ -3,3 +3,5 @@ node_modules/
 *.zip
 *.crx
 *.pem
+tests/node_modules/
+tests/.shots/

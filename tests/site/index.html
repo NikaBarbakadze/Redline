@@ -1,0 +1,37 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Cozy Crafts — Test Store</title>
+<style>
+  body { margin:0; font-family: Georgia, serif; background:#fffaf3; color:#3b2f2f; }
+  header { position: sticky; top:0; background:#3b2f2f; color:#fff; display:flex; justify-content:space-between; align-items:center; padding:14px 32px; z-index: 50; }
+  header nav a { color:#fff; margin-left:20px; text-decoration:none; }
+  .hero { display:grid; grid-template-columns: 1.1fr 1fr; gap:40px; padding:64px 32px; align-items:center; }
+  .hero h1 { font-size:48px; margin:0 0 12px; line-height:1.1; }
+  .hero p { font-size:18px; color:#6b5b5b; }
+  .btn { display:inline-block; background:#d9480f; color:#fff; border:0; padding:14px 28px; border-radius:999px; font-size:16px; cursor:pointer; text-decoration:none; }
+  .art { height:320px; border-radius:24px; background: linear-gradient(135deg,#ffc9a9,#f783ac 60%,#9775fa); }
+  .grid { display:grid; grid-template-columns:repeat(3,1fr); gap:24px; padding:0 32px 64px; }
+  .card { background:#fff; border-radius:16px; padding:20px; box-shadow:0 2px 12px rgba(0,0,0,.06); }
+  .card .thumb { height:140px; border-radius:12px; background:#ffe8cc; margin-bottom:14px; }
+  .tall { height: 900px; background: repeating-linear-gradient(0deg,#fff4e6 0 40px,#fff 40px 80px); margin: 0 32px; border-radius: 16px; }
+  dialog { border:0; border-radius:16px; padding:28px; box-shadow:0 20px 60px rgba(0,0,0,.3); }
+  dialog::backdrop { background: rgba(0,0,0,.4); }
+</style></head>
+<body>
+<header><strong>Cozy Crafts</strong><nav><a href="/shop" id="shop-link">Shop</a><a href="#">About</a><a href="#" id="open-modal">Quiz</a></nav></header>
+<section class="hero" id="shopify-section-template--1234__hero">
+  <div class="hero__content"><h1 class="hero__title">Your first box is free</h1><p class="hero__sub">Monthly crochet kits delivered to your door. Cancel anytime.</p><a class="btn hero__cta" href="/checkout" id="cta">Get my free box</a></div>
+  <div class="art"></div>
+</section>
+<section class="grid">
+  <div class="card product-card"><div class="thumb"></div><h3 class="product-card__title">Autumn Box</h3><p>$34.99 / month</p></div>
+  <div class="card product-card"><div class="thumb"></div><h3 class="product-card__title">Winter Box</h3><p>$34.99 / month</p></div>
+  <div class="card product-card"><div class="thumb"></div><h3 class="product-card__title">Spring Box</h3><p>$34.99 / month</p></div>
+</section>
+<div class="tall"></div>
+<dialog id="quiz"><h2 class="quiz__title">Which yarn are you?</h2><p>Answer 3 questions.</p><button class="btn quiz__start" id="quiz-start">Start quiz</button></dialog>
+<script>
+  window.clicks = [];
+  document.addEventListener('click', e => { window.clicks.push(e.target.id || e.target.tagName); });
+  document.getElementById('open-modal').onclick = (e) => { e.preventDefault(); document.getElementById('quiz').showModal(); };
+</script>
+</body></html>
