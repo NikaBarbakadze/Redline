@@ -391,21 +391,30 @@
     pickAbort = null;
     cancelAnimationFrame(pick.raf);
     setCursor(false);
+    holdFrames(false);
     $.hud?.classList.remove('on', 'dragging');
     $.hl?.classList.remove('on');
     $.tag?.classList.remove('on');
     $.rg?.classList.remove('on');
   }
 
-  function setCursor(onOff) {
-    let style = document.getElementById('redline-cursor');
-    if (!onOff) return style?.remove();
+  function pageStyle(id, css) {
+    let style = document.getElementById(id);
+    if (!css) return style?.remove();
     if (style) return;
     style = document.createElement('style');
-    style.id = 'redline-cursor';
-    style.textContent = 'html,html *{cursor:crosshair!important;user-select:none!important;-webkit-user-select:none!important}';
+    style.id = id;
+    style.textContent = css;
     (document.head ?? document.documentElement).append(style);
   }
+
+  const setCursor = (onOff) =>
+    pageStyle('redline-cursor', onOff && 'html,html *{cursor:crosshair!important;user-select:none!important;-webkit-user-select:none!important}');
+
+  // While a drag that started here is on, iframes don't take the pointer, so it
+  // keeps coming to this frame as the box crosses them. (Pointer capture can't
+  // do this: Chrome still routes into out-of-process iframes.)
+  const holdFrames = (onOff) => pageStyle('redline-drag', onOff && 'iframe,frame{pointer-events:none!important}');
 
   const ours = (e) => e.target === host;
 
@@ -430,16 +439,11 @@
       return;
     }
     const { clientX: x, clientY: y } = e;
+    if (pick.drag && !(e.buttons & 1)) dropDrag(); // let go in another frame
     if (pick.drag) {
       const d = pick.drag;
-      if (!d.active && Math.hypot(x - d.x, y - d.y) > 5) {
-        d.active = true;
-        $.hl.classList.remove('on');
-        $.tag.classList.remove('on');
-        $.rg.classList.add('on');
-        $.hud.classList.add('dragging');
-      }
-      if (d.active) drawRegion(d.x, d.y, x, y);
+      if (!d.active && Math.hypot(x - d.x, y - d.y) > 5) d.active = true;
+      if (d.active) showDrag(d.x, d.y, x, y);
       return;
     }
     cancelAnimationFrame(pick.raf);
@@ -476,24 +480,63 @@
     swallow(e);
     if (e.button !== 0) return;
     pick.drag = { x: e.clientX, y: e.clientY, active: false };
+    holdFrames(true);
   }
 
   function onPickUp(e) {
     if (ours(e)) return;
     swallow(e);
     const d = pick.drag;
-    pick.drag = null;
+    dropDrag();
     if (!d || e.button !== 0) return;
     swallowNextClick();
-    hoverAt(e.clientX, e.clientY); // a fast click can land before the hover frame
+    const { clientX: x, clientY: y } = e;
+    hoverAt(x, y); // a fast click can land before the hover frame
     if (d.active) {
-      $.rg.classList.remove('on');
-      $.hud.classList.remove('dragging');
-      const r = rectFromPoints(d.x, d.y, e.clientX, e.clientY);
-      if (r.w >= 8 && r.h >= 8) return submit(areaPayload(r));
+      // A box let go of outside this frame (only if Chrome kept routing the
+      // pointer here) is captured further up.
+      const local = IS_TOP || (x >= 0 && y >= 0 && x <= innerWidth && y <= innerHeight);
+      if (!IS_TOP) toParent({ type: 'drag', rect: { x: d.x, y: d.y, w: x - d.x, h: y - d.y }, done: true, local });
+      const r = rectFromPoints(d.x, d.y, x, y);
+      if (local && r.w >= 8 && r.h >= 8) submit(areaPayload(r));
       return;
     }
     if (pick.el) submit(elementPayload(pick.el));
+  }
+
+  // The top frame draws every drag box, so one started in an iframe can leave
+  // it. Child frames send the corners up as a signed rect (the hops only shift
+  // x/y, so the start corner stays put), and each frame on the way records the
+  // drag, so it carries on if the pointer comes out over that frame.
+  function showDrag(x0, y0, x1, y1) {
+    $.hl.classList.remove('on');
+    $.tag.classList.remove('on');
+    if (!IS_TOP) return toParent({ type: 'drag', rect: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } });
+    $.rg.classList.add('on');
+    $.hud.classList.add('dragging');
+    drawRegion(x0, y0, x1, y1);
+  }
+
+  function dropDrag() {
+    pick.drag = null;
+    holdFrames(false);
+    if (!IS_TOP) return;
+    $.rg.classList.remove('on');
+    $.hud.classList.remove('dragging');
+  }
+
+  // `rect` is in this frame's coordinates by now.
+  function dragFromChild({ rect: r, done, local }) {
+    if (mode !== 'picking') return;
+    const [x1, y1] = [r.x + r.w, r.y + r.h];
+    if (!done) {
+      pick.drag = { x: r.x, y: r.y, active: true };
+      return showDrag(r.x, r.y, x1, y1);
+    }
+    dropDrag();
+    if (!IS_TOP) return toParent({ type: 'drag', rect: r, done, local });
+    const a = rectFromPoints(r.x, r.y, x1, y1);
+    if (!local && a.w >= 8 && a.h >= 8) submit(areaPayload(a));
   }
 
   const NAV_KEYS = ['Enter', 'ArrowUp', 'ArrowDown'];
@@ -1699,7 +1742,8 @@
   // -------------------------------------------------------------------------
   // Frames. Child frames pick on their own and post the result to their parent,
   // which translates it by the <iframe>'s offset and passes it on, hop by hop,
-  // until it reaches the top frame. Commands go back down through the worker.
+  // until it reaches the top frame. Drag boxes travel the same way, but the top
+  // frame draws them (see showDrag). Commands go back down through the worker.
 
   const childAgents = new Set(); // <iframe>s whose document runs Redline
   let topComposing = false; // child frames: the top frame's composer is open
@@ -1786,7 +1830,8 @@
     }
     const box = frameBox(frame);
     const up = { ...m, rect: shift(m.rect, box), bounds: m.bounds && overlap(shift(m.bounds, box), box) };
-    if (IS_TOP) fromChild(up);
+    if (m.type === 'drag') dragFromChild(up);
+    else if (IS_TOP) fromChild(up);
     else toParent(up);
   }
 

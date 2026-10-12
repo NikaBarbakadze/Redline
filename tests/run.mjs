@@ -8,6 +8,7 @@ const suites = [
   ['capture.mjs'],
   ['pages.mjs'],
   ['iframes.mjs'],
+  ['drag-frames.mjs'],
   ['history.mjs'],
   ['panel-sync.mjs'],
   ['paste-anywhere.mjs'],

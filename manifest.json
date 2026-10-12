@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Redline",
   "short_name": "Redline",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "description": "Point at anything on a page, say what should change, paste the whole session into Claude.",
   "minimum_chrome_version": "123",
   "icons": {

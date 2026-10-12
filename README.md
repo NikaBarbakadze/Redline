@@ -127,7 +127,7 @@ No build step and no runtime dependencies: plain JavaScript on Manifest V3.
 
 | File | Role |
 |---|---|
-| `src/content.js` | All in-page UI (picker, composer, dock, notes panel) in a shadow root, so page styles can't leak in. It runs in every frame: child frames pick on their own and post the result up, offset by each `<iframe>`'s content box, until the top frame takes the screenshot, crops it and outlines the target. The UI is a manual popover, so it sits in the top layer above the page's own modals. When a modal `<dialog>` is open, Redline moves inside it so it isn't made inert. While idle, it costs one storage read and a pointer listener. |
+| `src/content.js` | All in-page UI (picker, composer, dock, notes panel) in a shadow root, so page styles can't leak in. It runs in every frame: child frames pick on their own and post the result up, offset by each `<iframe>`'s content box, until the top frame takes the screenshot, crops it and outlines the target. The top frame draws every drag box, so an area can be dragged across an iframe's edge either way. The UI is a manual popover, so it sits in the top layer above the page's own modals. When a modal `<dialog>` is open, Redline moves inside it so it isn't made inert. While idle, it costs one storage read and a pointer listener. |
 | `src/background.js` | The service worker. Captures the tab, stores screenshots and History in IndexedDB (only the active session lives in `chrome.storage`, so tabs stay in sync without passing megabytes of base64 around), writes the PNGs, builds the prompt and numbers the images for web-chat pastes. |
 | `src/offscreen.*` | Clipboard fallback. |
 | `welcome.html` | First-run page with a practice card. |
