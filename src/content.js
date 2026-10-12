@@ -1,4 +1,4 @@
-// Redline — the in-page UI: element/area picker, note composer, pins, dock and
+// Redline — the in-page UI: element/area picker, note composer, dock and
 // review sheet. Plain DOM in a shadow root; idle cost on a page is one storage
 // read and a pointer listener.
 (() => {
@@ -16,7 +16,7 @@
   const IS_EXTENSION_PAGE = location.protocol === 'chrome-extension:';
   // Redline runs in every frame. The top frame owns the composer, dock, sheet
   // and the screenshot; child frames (e.g. a Shopify app inside the admin) only
-  // pick and show their own pins.
+  // pick and hand what they picked up.
   const IS_TOP = window === window.top;
 
   let session = null; // { id, folder, createdAt, items: [...] }
@@ -25,7 +25,7 @@
   let sheetView = 'current'; // current | history | entry
   let history = null; // History summaries, newest first (loaded when the sheet opens)
   let entry = null; // the archived session open in the sheet
-  let uiHidden = false; // Esc tucked the dock and pins away (all tabs) until the next capture
+  let uiHidden = false; // Esc tucked the dock away (all tabs) until the next capture
   let lastCopy = null; // { id, hash, at }: the last text Redline copied (see onPaste)
   let plainNext = 0; // ⇧⌘V was pressed: leave the next paste alone until this time
   let shortcutLabel = isMac ? '⌘⇧S' : 'Ctrl+Shift+S';
@@ -125,7 +125,8 @@
     return parts.join(' > ') || el.tagName.toLowerCase();
   }
 
-  // Exact path, used only to find the element again for its pin.
+  // Exact path, used only to find the element again (Show on page, and to
+  // tell the picker what's already noted).
   function exactPath(el) {
     const parts = [];
     for (let n = el; n?.nodeType === 1 && n !== document.documentElement; n = n.parentElement) {
@@ -163,7 +164,7 @@
   }
 
   function elementAt(x, y) {
-    let el = document.elementsFromPoint(x, y).find((n) => n !== host && n !== pinsHost);
+    let el = document.elementsFromPoint(x, y).find((n) => n !== host);
     // Look inside open shadow roots (web components).
     while (el?.shadowRoot) {
       const inner = el.shadowRoot.elementFromPoint(x, y);
@@ -239,7 +240,7 @@
   }
 
   function setHidden(hidden) {
-    for (const h of [host, pinsHost]) h?.style.setProperty('visibility', hidden ? 'hidden' : 'visible', 'important');
+    host?.style.setProperty('visibility', hidden ? 'hidden' : 'visible', 'important');
   }
 
   // A clicked button keeps focus even after its panel hides, and keys on it
@@ -339,7 +340,7 @@
   // menus and tooltips can be captured too.
 
   let pickAbort = null;
-  const pick = { base: null, el: null, trail: [], drag: null, raf: 0 };
+  const pick = { base: null, el: null, trail: [], drag: null, raf: 0, notedFor: null, noted: [] };
 
   function startPicking() {
     if (mode === 'composing') return focusComposer();
@@ -356,7 +357,7 @@
       toFrames({ type: 'frame:start' });
     }
 
-    Object.assign(pick, { base: null, el: null, trail: [], drag: null });
+    Object.assign(pick, { base: null, el: null, trail: [], drag: null, notedFor: null });
     pickAbort = new AbortController();
     const opts = { capture: true, passive: false, signal: pickAbort.signal };
     addEventListener('pointermove', onPickMove, opts);
@@ -373,7 +374,6 @@
       $.hud.classList.add('on');
       $.hud.classList.toggle('top', pointer.y > innerHeight - 110);
     }
-    pinsLayer?.classList.add('picking');
     render();
     if (pointer.x >= 0) hoverAt(pointer.x, pointer.y);
   }
@@ -395,7 +395,6 @@
     $.hl?.classList.remove('on');
     $.tag?.classList.remove('on');
     $.rg?.classList.remove('on');
-    pinsLayer?.classList.remove('picking');
   }
 
   function setCursor(onOff) {
@@ -408,7 +407,7 @@
     (document.head ?? document.documentElement).append(style);
   }
 
-  const ours = (e) => e.target === host || e.target === pinsHost;
+  const ours = (e) => e.target === host;
 
   function swallow(e) {
     if (ours(e)) return;
@@ -526,23 +525,54 @@
 
   function drawHighlight(el) {
     const r = el.getBoundingClientRect();
-    const radius = parseFloat(getComputedStyle(el).borderTopLeftRadius) || 0;
     Object.assign($.hl.style, {
       transform: `translate(${r.left}px, ${r.top}px)`,
       width: `${r.width}px`,
       height: `${r.height}px`,
-      borderRadius: `${Math.min(radius, r.height / 2, r.width / 2)}px`,
+      borderRadius: radiiOf(el, r.width, r.height).map((v) => `${v}px`).join(' '),
     });
     $.hl.classList.add('on');
 
+    if (pick.notedFor !== el) (pick.notedFor = el), (pick.noted = notesOn(el));
+    const noted = pick.noted;
+    $.hl.classList.toggle('noted', noted.length > 0);
+    $.tag.classList.toggle('noted', noted.length > 0);
+    $.tagNums.replaceChildren(...noted.map(({ n }) => Object.assign(document.createElement('span'), { textContent: n })));
+    $.tagNote.textContent = noted.map((x) => x.note).filter(Boolean).join(' · ');
     $.tagName.textContent = describe(el);
     $.tagSize.textContent = `${Math.round(r.width)} × ${Math.round(r.height)}`;
     $.tag.classList.add('on');
     const tw = $.tag.offsetWidth;
+    const th = $.tag.offsetHeight;
     const tx = clamp(r.left, 6, innerWidth - tw - 6);
-    let ty = r.top - 28;
-    if (ty < 6) ty = r.bottom + 6 < innerHeight - 28 ? r.bottom + 6 : clamp(r.top, 0, innerHeight) + 6;
+    let ty = r.top - th - 6;
+    if (ty < 6) ty = r.bottom + th + 12 < innerHeight ? r.bottom + 6 : clamp(r.top, 0, innerHeight) + 6;
     $.tag.style.transform = `translate(${tx}px, ${ty}px)`;
+  }
+
+  // Notes already taken on this element, numbered as in the panel and the
+  // prompt. Matched by the element itself (exact path, tag, classes and text),
+  // never by a saved position, so it can't point at the wrong thing.
+  function notesOn(el) {
+    const out = [];
+    session?.items.forEach((item, i) => {
+      if (item.kind !== 'element' || !(IS_TOP ? !item.frameUrl && item.url === pageKey() : item.frameUrl === frameKey())) return;
+      if (findLive(item) !== el || describe(el) !== item.target?.label || textOf(el) !== (item.target?.text ?? '')) return;
+      out.push({ n: i + 1, note: item.note });
+    });
+    return out;
+  }
+
+  // Corner radii [top-left, top-right, bottom-right, bottom-left] in px. Corners
+  // differ more often than you'd think (Shopify admin's title bar rounds only
+  // its top-right one).
+  function radiiOf(el, w, h) {
+    const cs = getComputedStyle(el);
+    return [cs.borderTopLeftRadius, cs.borderTopRightRadius, cs.borderBottomRightRadius, cs.borderBottomLeftRadius].map((v) => {
+      const first = v.split(' ')[0]; // elliptical corners: the horizontal radius
+      const px = first.endsWith('%') ? (parseFloat(first) / 100) * w : parseFloat(first);
+      return Math.min(px || 0, w / 2, h / 2);
+    });
   }
 
   function rectFromPoints(x0, y0, x1, y1) {
@@ -590,17 +620,17 @@
     return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
   }
 
-  // What was picked, in this frame's viewport coordinates. `pin` stays in this
-  // frame's document coordinates (pins render where the element lives).
+  // What was picked, in this frame's viewport coordinates. `doc` is the same in
+  // this frame's document coordinates (Show on page falls back to it).
   function elementPayload(el) {
     const rect = viewportRect(el.getBoundingClientRect());
     const fixed = isFixed(el);
     return {
       kind: 'element',
       rect,
-      radius: parseFloat(getComputedStyle(el).borderTopLeftRadius) || 0,
+      radius: radiiOf(el, rect.w, rect.h),
       fixed,
-      pin: fixed ? rect : { ...rect, x: rect.x + scrollX, y: rect.y + scrollY },
+      doc: fixed ? rect : { ...rect, x: rect.x + scrollX, y: rect.y + scrollY },
       css: exactPath(el),
       target: { label: describe(el), path: readablePath(el), text: textOf(el) },
     };
@@ -611,7 +641,7 @@
     return {
       kind: 'area',
       rect: r,
-      pin: { ...r, x: r.x + scrollX, y: r.y + scrollY },
+      doc: { ...r, x: r.x + scrollX, y: r.y + scrollY },
       target: center ? { label: describe(center), path: readablePath(center) } : null,
     };
   }
@@ -644,7 +674,7 @@
       crop: element ? contextCrop(visible) : visible,
       ring: element ? { ...p.rect, radius: p.radius } : null,
       fixed: !!p.fixed,
-      rect: p.pin,
+      rect: p.doc,
       css: p.css ?? null,
       target: p.target ?? null,
       frameUrl: p.frameUrl ?? null,
@@ -662,7 +692,7 @@
     setHidden(true);
     let shot;
     try {
-      await toFrames({ type: 'frame:snap', hidden: true }); // child frames stop picking, hide their pins
+      await toFrames({ type: 'frame:snap', hidden: true }); // child frames stop picking, hide their highlight
       await frames(2); // let the hidden UI paint out
       shot = await send({ type: 'capture' });
     } catch (err) {
@@ -731,7 +761,8 @@
       ctx.shadowColor = 'rgba(0,0,0,0.25)';
       ctx.shadowBlur = 3 * f;
       ctx.beginPath();
-      ctx.roundRect(x, y, x2 - x, y2 - y, Math.min((ring.radius + gap) * f, (x2 - x) / 2, (y2 - y) / 2));
+      const max = Math.min((x2 - x) / 2, (y2 - y) / 2);
+      ctx.roundRect(x, y, x2 - x, y2 - y, [].concat(ring.radius).map((v) => Math.min((v + gap) * f, max)));
       ctx.stroke();
       ctx.restore();
     }
@@ -944,7 +975,7 @@
 
   // Scroll a note's element into view and open it for editing.
   async function showItem(item) {
-    const live = livePinRect(item);
+    const live = liveRect(item);
     let r = live && !live.hidden ? live : item.rect;
     if (!item.fixed) {
       const top = r.y - scrollY;
@@ -1269,7 +1300,7 @@
     return !!document.querySelector('dialog[open], [aria-modal="true"], :popover-open:not(redline-ui)');
   }
 
-  // Keys typed into Redline (composer, note fields, buttons, pins) never reach
+  // Keys typed into Redline (composer, note fields, buttons) never reach
   // the page; their default action (typing, button activation) still happens.
   function ownKey(e, late) {
     if (!late) e.stopImmediatePropagation();
@@ -1624,7 +1655,7 @@
   }
 
   // -------------------------------------------------------------------------
-  // Render: dock + pins + sheet from the current session.
+  // Render: dock + sheet from the current session.
 
   function render() {
     const items = session?.items ?? [];
@@ -1636,9 +1667,8 @@
       $.dockLabel.textContent = items.length === 1 ? 'note' : 'notes';
       if (sheetOpen) renderSheet();
     }
-    renderPins();
-    pinsLayer?.classList.toggle('busy', mode !== 'idle' || sheetOpen);
-    pinsLayer?.classList.toggle('gone', uiHidden && mode === 'idle' && !sheetOpen);
+    // The session changed under the picker (e.g. ⌘↵ saves while the next pick starts).
+    if (mode === 'picking' && pick.el && $.hl?.classList.contains('on')) (pick.notedFor = null), drawHighlight(pick.el);
   }
 
   function bumpDock() {
@@ -1646,64 +1676,6 @@
     $.dockCount.classList.remove('bump');
     void $.dockCount.offsetWidth;
     $.dockCount.classList.add('bump');
-  }
-
-  // Pins: numbered markers on the page where each note was taken.
-  let pinsHost = null;
-  let pinsLayer = null;
-  const pinEls = new Map();
-
-  function ensurePins() {
-    if (pinsHost) {
-      if (!pinsHost.isConnected) document.documentElement.append(pinsHost);
-      return;
-    }
-    pinsHost = document.createElement('redline-pins');
-    pinsHost.style.cssText =
-      'all:initial!important;position:absolute!important;left:0!important;top:0!important;width:0!important;height:0!important;' +
-      'overflow:visible!important;display:block!important;pointer-events:none!important;z-index:2147483646!important;';
-    const shadow = pinsHost.attachShadow({ mode: 'open' });
-    shadow.innerHTML = `<style>${PIN_CSS}</style><div class="layer"></div>`;
-    pinsLayer = shadow.querySelector('.layer');
-    isolate(shadow);
-    shadow.addEventListener('click', (e) => {
-      const pin = e.target.closest('.p');
-      if (!pin || mode !== 'idle') return;
-      e.preventDefault();
-      // The editor opens over the pin (maybe from another frame); drop its tooltip.
-      pinsLayer.classList.add('quiet');
-      pin.addEventListener('pointerleave', () => pinsLayer.classList.remove('quiet'), { once: true });
-      const item = session?.items.find((i) => i.id === pin.dataset.id);
-      if (item) closeSheet(), showItem(item);
-      dropButtonFocus(e, shadow);
-    });
-    document.documentElement.append(pinsHost);
-  }
-
-  function renderPins() {
-    const here = IS_TOP ? pageKey() : frameKey();
-    const mine = (session?.items ?? [])
-      .map((item, i) => [item, i])
-      .filter(([item]) => item.kind !== 'screen' && (IS_TOP ? !item.frameUrl && item.url === here : item.frameUrl === here));
-    if (!mine.length && !pinsHost) return;
-    ensurePins();
-    const seen = new Set();
-    for (const [item, i] of mine) {
-      seen.add(item.id);
-      let pin = pinEls.get(item.id);
-      if (!pin) {
-        pin = document.createElement('button');
-        pin.className = 'p';
-        pin.dataset.id = item.id;
-        pin.innerHTML = '<span class="n"></span><span class="tip"></span>';
-        pinEls.set(item.id, pin);
-        pinsLayer.append(pin);
-      }
-      pin.firstChild.textContent = i + 1;
-      pin.lastChild.textContent = item.note;
-      placePin(pin, item);
-    }
-    for (const [id, pin] of pinEls) if (!seen.has(id)) pin.remove(), pinEls.delete(id);
   }
 
   function findLive(item) {
@@ -1716,34 +1688,12 @@
   }
 
   // Current rect of a note's element (document coords, or viewport if fixed).
-  function livePinRect(item) {
+  function liveRect(item) {
     const el = findLive(item);
     if (!el) return null;
     const b = el.getBoundingClientRect();
     if (!b.width && !b.height) return { hidden: true };
     return item.fixed ? viewportRect(b) : { x: b.left + scrollX, y: b.top + scrollY, w: b.width, h: b.height };
-  }
-
-  function placePin(pin, item) {
-    const live = livePinRect(item);
-    pin.hidden = !!live?.hidden;
-    if (live?.hidden) return;
-    const r = live ?? item.rect;
-    const maxX = (item.fixed ? innerWidth : document.documentElement.scrollWidth) - 14;
-    const x = Math.min(r.x + r.w - 2, maxX);
-    const y = Math.max(r.y + 2, 14);
-    pin.classList.toggle('fixed', !!item.fixed);
-    pin.style.left = `${x}px`;
-    pin.style.top = `${y}px`;
-    pin.classList.toggle('flip', (item.fixed ? x : x - scrollX) > innerWidth - 300);
-  }
-
-  function pulsePin(id) {
-    const pin = pinEls.get(id);
-    if (!pin) return;
-    pin.classList.remove('pulse');
-    void pin.offsetWidth;
-    pin.classList.add('pulse');
   }
 
   // -------------------------------------------------------------------------
@@ -1920,7 +1870,6 @@
     composerAbort?.abort();
     setCursor(false);
     host?.remove();
-    pinsHost?.remove();
     clearInterval(watch);
     try {
       chrome.runtime.onMessage.removeListener(onMessage);
@@ -1941,18 +1890,15 @@
     }
   });
   if (!IS_TOP) toParent({ type: 'hello' });
-  on(window, 'resize', () => pinEls.size && renderPins(), { passive: true });
 
-  // SPA navigation and late layout shifts move things around; re-check now and then.
+  // SPA navigation: a composer opened on the old page shouldn't linger.
   const here = IS_TOP ? pageKey : frameKey;
   let lastUrl = here();
   const watch = setInterval(() => {
     if (!chrome.runtime?.id) return teardown();
-    if (here() !== lastUrl) {
-      lastUrl = here();
-      if (mode === 'composing') closeComposer();
-      renderPins();
-    } else if (pinEls.size) renderPins();
+    if (here() === lastUrl) return;
+    lastUrl = here();
+    if (mode === 'composing') closeComposer();
   }, 1200);
 
   chrome.runtime.onMessage.addListener(onMessage);
@@ -1973,7 +1919,7 @@
   });
 
   // Exposed for pages that host Redline directly (the welcome page).
-  window.__redline = { start: () => startPicking(), review: () => openSheet(), pulsePin };
+  window.__redline = { start: () => startPicking(), review: () => openSheet() };
 
   // -------------------------------------------------------------------------
   // Markup + styles
@@ -2006,7 +1952,7 @@
   const TEMPLATE = `
   <div class="r" data-ref="r">
     <div class="hl" data-ref="hl"></div>
-    <div class="tag" data-ref="tag"><span data-ref="tagName"></span><span class="d" data-ref="tagSize"></span></div>
+    <div class="tag" data-ref="tag"><div class="tag-row"><span class="tag-nums" data-ref="tagNums"></span><span data-ref="tagName"></span><span class="d" data-ref="tagSize"></span></div><div class="tag-note" data-ref="tagNote"></div></div>
     <div class="rg" data-ref="rg"><span class="rg-size" data-ref="rgSize"></span></div>
     <div class="spot" data-ref="spot"></div>
     <div class="veil" data-ref="veil" data-act="veil"></div>
@@ -2193,13 +2139,24 @@
     transition: transform .09s var(--ease), width .09s var(--ease), height .09s var(--ease), border-radius .09s, opacity .12s;
     will-change: transform, width, height;
   }
+  .hl.noted { background: color-mix(in srgb, var(--red) 9%, transparent); box-shadow: 0 0 0 1.5px var(--red); }
   .hl.on, .tag.on, .rg.on { opacity: 1; }
   .tag {
-    position: fixed; left: 0; top: 0; pointer-events: none; opacity: 0; display: flex; align-items: center; gap: 7px; height: 22px; padding: 0 8px;
-    border-radius: 6px; background: rgba(28,28,30,.92); color: #fff; font: 500 11px/1 ${MONO}; white-space: nowrap;
+    position: fixed; left: 0; top: 0; pointer-events: none; opacity: 0; padding: 0 8px; border-radius: 6px;
+    background: rgba(28,28,30,.92); color: #fff; font: 500 11px/1 ${MONO}; white-space: nowrap;
     box-shadow: 0 2px 10px rgba(0,0,0,.18); transition: opacity .12s;
   }
+  .tag-row { display: flex; align-items: center; gap: 7px; height: 22px; }
   .tag .d { color: rgba(255,255,255,.5); }
+  /* Already noted: its number(s) and the note, so nothing gets captured twice */
+  .tag.noted { padding: 3px 8px 8px; }
+  .tag-nums { display: inline-flex; gap: 3px; }
+  .tag-nums span {
+    display: inline-grid; place-items: center; min-width: 16px; height: 16px; padding: 0 4px; border-radius: 8px;
+    background: var(--red); font: 600 10.5px/1 ${FONT}; font-variant-numeric: tabular-nums;
+  }
+  .tag-note { max-width: 300px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; font: 400 12px/1.3 ${FONT}; color: rgba(255,255,255,.88); }
+  .tag-nums:empty, .tag-note:empty { display: none; }
   .rg {
     position: fixed; left: 0; top: 0; pointer-events: none; opacity: 0;
     background: color-mix(in srgb, var(--blue) 6%, transparent);
@@ -2385,36 +2342,5 @@
   .toast button:hover { background: var(--fill); }
 
   @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition-duration: 0s !important; animation-duration: 0s !important; } }
-  `;
-
-  const PIN_CSS = `
-  :host { all: initial; }
-  .layer { position: absolute; left: 0; top: 0; width: 0; height: 0; }
-  [hidden] { display: none !important; }
-  .p {
-    position: absolute; width: 22px; height: 22px; margin: -11px 0 0 -11px; padding: 0; border: 0; border-radius: 11px;
-    display: grid; place-items: center; cursor: pointer; pointer-events: auto;
-    background: #ff3b30; color: #fff; font: 600 11.5px/1 ${FONT}; font-variant-numeric: tabular-nums; -webkit-font-smoothing: antialiased;
-    box-shadow: 0 0 0 2px #fff, 0 2px 8px rgba(0,0,0,.28);
-    transition: transform .25s cubic-bezier(.34,1.4,.64,1); animation: pop .45s cubic-bezier(.34,1.4,.64,1) both;
-  }
-  .p.fixed { position: fixed; }
-  .p:hover { transform: scale(1.14); }
-  .layer.picking .p { pointer-events: none; opacity: .55; }
-  .p { transition: transform .25s cubic-bezier(.34,1.4,.64,1), opacity .2s; }
-  .layer.gone .p { opacity: 0; pointer-events: none; transform: scale(.6); }
-  .p.pulse { animation: pulse 1.1s ease-out; }
-  @keyframes pop { from { transform: scale(0); } }
-  @keyframes pulse { 0% { box-shadow: 0 0 0 2px #fff, 0 0 0 2px rgba(255,59,48,.6); } 100% { box-shadow: 0 0 0 2px #fff, 0 0 0 22px rgba(255,59,48,0); } }
-  .tip {
-    position: absolute; left: 30px; top: -4px; width: max-content; max-width: 280px; padding: 8px 11px; border-radius: 10px;
-    background: rgba(28,28,30,.94); color: #fff; font: 400 12.5px/1.4 ${FONT}; text-align: left; white-space: pre-wrap;
-    box-shadow: 0 8px 28px rgba(0,0,0,.25); pointer-events: none; opacity: 0; transform: translateX(-4px); transition: opacity .15s, transform .2s;
-    display: -webkit-box; -webkit-line-clamp: 6; -webkit-box-orient: vertical; overflow: hidden;
-  }
-  .layer.busy .tip, .layer.quiet .tip { display: none; }
-  .p.flip .tip { left: auto; right: 30px; transform: translateX(4px); }
-  .p:hover .tip { opacity: 1; transform: none; }
-  .tip:empty { display: none; }
   `;
 })();

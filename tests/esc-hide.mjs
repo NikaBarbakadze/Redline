@@ -1,27 +1,26 @@
-// Esc with nothing open hides the dock and pins (all tabs, survives reload)
+// Esc with nothing open hides the dock (all tabs, survives reload)
 // until the next capture; Esc in a field is left alone; Esc inside an iframe
 // closes the panel, then hides the session there too.
 import { run, check, toggle, note, ui, hasClass } from './harness.mjs';
 
 await run('Esc hides the session', async ({ sw, page }) => {
   const dock = () => hasClass(ui(page, '.dock'), 'on');
-  const pinsHidden = (f = page) => f.evaluate(() => document.querySelector('redline-pins')?.shadowRoot.querySelector('.layer').classList.contains('gone'));
   await page.goto('http://localhost:4818/');
   await note(sw, page, page.locator('#cta'), 'Green CTA.');
   await note(sw, page, page.locator('.hero__title'), 'Caps.');
 
   await page.keyboard.press('Escape');
   await page.waitForTimeout(400);
-  check('Esc hides the dock and pins', !(await dock()) && (await pinsHidden()));
+  check('Esc hides the dock', !(await dock()));
   check('the first time, a hint explains how they come back', (await ui(page, '[data-ref=toastText]').textContent()).startsWith('Notes hidden'));
   await page.reload();
   await page.waitForTimeout(800);
-  check('still hidden after a reload', (await pinsHidden()) && !(await dock().catch(() => false)));
+  check('still hidden after a reload', (await ui(page, '.dock').count()) === 1 && !(await dock()));
 
   await toggle(sw, page);
   await page.keyboard.press('Escape');
   await page.waitForTimeout(400);
-  check('a capture brings them back', (await dock()) && !(await pinsHidden()));
+  check('a capture brings it back', await dock());
 
   await page.evaluate(() => document.body.prepend(Object.assign(document.createElement('input'), { id: 'q' })));
   await page.click('#q');
@@ -47,5 +46,5 @@ await run('Esc hides the session', async ({ sw, page }) => {
   check('Esc with focus in an iframe closes the panel', !(await hasClass(ui(page, '.sheet'), 'on')));
   await page.keyboard.press('Escape');
   await page.waitForTimeout(500);
-  check('…and the next one hides the session, iframe pins included', !(await dock()) && (await pinsHidden(app)));
+  check('…and the next one hides the session', !(await dock()));
 }, { width: 1440, height: 900 });

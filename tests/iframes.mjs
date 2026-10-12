@@ -1,6 +1,7 @@
 // A Shopify-admin-like page with the app in a cross-origin iframe (bordered,
 // padded, scrolling): picking, ↑ forwarded from the top frame, area drag, Esc,
-// pins inside the iframe, and the iframe URL (without its tokens) in the prompt.
+// what's already noted flagged inside the iframe, and the iframe URL (without
+// its tokens) in the prompt.
 import { run, check, toggle, pick, ui, hasClass, clip } from './harness.mjs';
 
 const OFF = 12; // the iframe's 8px border + 4px padding
@@ -51,12 +52,17 @@ await run('Cross-origin iframes', async ({ sw, page }) => {
   await page.waitForTimeout(500);
 
   await toggle(sw, page);
+  const again = await app.locator('#create-quiz').boundingBox();
+  await page.mouse.move(again.x + OFF + again.width / 2, again.y + OFF + again.height / 2, { steps: 3 });
+  await page.waitForTimeout(200);
+  const flagged = await app.evaluate(() => {
+    const r = document.querySelector('redline-ui').shadowRoot;
+    return [r.querySelector('[data-ref=tagNums]').textContent, r.querySelector('[data-ref=tagNote]').textContent, r.querySelector('.hl').classList.contains('noted')];
+  });
+  check('picking inside the iframe flags what is already noted', flagged[0] === '1' && flagged[1].startsWith('Make "Create quiz"') && flagged[2], JSON.stringify(flagged));
   await app.locator('body').press('Escape');
   await page.waitForTimeout(300);
   check('Esc inside the iframe cancels capture', !(await hasClass(ui(page, '.hud'), 'on')));
-  const pinsIn = await app.locator('redline-pins >> .p').count();
-  const pinsTop = await page.locator('redline-pins >> .p').count();
-  check('pins render inside the iframe', pinsIn === 3 && pinsTop === 0, `iframe ${pinsIn}, top ${pinsTop}, badge ${await sw.evaluate(() => chrome.action.getBadgeText({}))}`);
   const clicks = await app.evaluate(() => window.clicks);
   check('the app never got a click', clicks.length === 0, JSON.stringify(clicks));
 

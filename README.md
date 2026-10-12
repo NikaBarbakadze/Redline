@@ -29,11 +29,11 @@ The welcome page that opens shows your shortcut and has a card to practice on.
 | <kbd>⌘</kbd><kbd>↵</kbd> | Save and capture the next one |
 | <kbd>⇧</kbd><kbd>↵</kbd> | New line |
 | <kbd>esc</kbd> | Cancel (twice if you've typed something) |
-| <kbd>esc</kbd> with nothing open | Hide the dock and pins until your next capture |
+| <kbd>esc</kbd> with nothing open | Hide the dock until your next capture |
 
 - Hover states stay live while picking, so open menus, tooltips and modals (including native `<dialog>`s) can be captured.
 - Works inside iframes, including cross-origin ones like an embedded app in Shopify admin or the theme editor preview. The note records the iframe's URL (path only, so session tokens stay out) and the element path inside it.
-- Red numbered pins mark what you've already covered. Hover one to read the note, click it to edit.
+- Nothing is drawn on the page between captures. While picking, an element you've already noted turns red and its label shows the note's number and text, so you don't capture it twice. The match is the element itself, not a saved position, so it never points at the wrong thing. To find a note's element again, click **This page** on its card in the panel.
 - The dock in the corner shows the count and has **Copy notes**. Click the count to open the notes panel: edit notes inline, zoom screenshots, copy a single screenshot, delete (with undo). The panel is one panel across tabs: it follows you to the next tab, and closing it anywhere closes it everywhere. Copying closes it.
 - A session spans tabs and pages. **Copying closes it**: it moves to History and your next note starts again at 1, so a forgotten "new session" can't mix batches. Copied too early? **Keep adding** in the toast reopens it.
 - **History** (the second tab in the panel, or right-click the icon → History) keeps your last 50 sessions. Open one to see its notes and screenshots, copy it again (same file paths), or **Continue** it to add more notes. Anything in progress is set aside into History first, so nothing is lost.
@@ -79,7 +79,7 @@ The format is built for **Claude Code**, which opens the screenshots from those 
 
 No build step and no dependencies.
 
-- `src/content.js`: all in-page UI (picker, composer, pins, dock, review sheet) in a shadow root. It runs in every frame. Child frames pick on their own and post the result to their parent, which offsets it by the `<iframe>`'s content box and passes it up until the top frame takes the screenshot and opens the composer. Keys follow the pointer between frames. The host is a manual popover so it sits in the top layer above the page's own modals. When a modal `<dialog>` is open, it moves inside the dialog so it isn't inert. Idle cost on a page is one storage read and a pointer listener.
+- `src/content.js`: all in-page UI (picker, composer, dock, review sheet) in a shadow root. It runs in every frame. Child frames pick on their own and post the result to their parent, which offsets it by the `<iframe>`'s content box and passes it up until the top frame takes the screenshot and opens the composer. Keys follow the pointer between frames. The host is a manual popover so it sits in the top layer above the page's own modals. When a modal `<dialog>` is open, it moves inside the dialog so it isn't inert. Idle cost on a page is one storage read and a pointer listener.
 - `src/background.js`: captures the tab, builds the numbered attachments for web-chat pastes, keeps screenshots, thumbnails and session History in IndexedDB (only the active session lives in `chrome.storage`, so tabs stay in sync without passing megabytes of base64 around), writes the PNGs with the download bubble suppressed and the downloads list cleaned up, and builds the prompt.
 - `src/offscreen.*`: clipboard fallback for when the page can't write it.
 
