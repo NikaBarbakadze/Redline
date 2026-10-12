@@ -1,0 +1,1587 @@
+// Redline — the in-page UI: element/area picker, note composer, pins, dock and
+// review sheet. Plain DOM in a shadow root; idle cost on a page is one storage
+// read and a pointer listener.
+(() => {
+  'use strict';
+
+  // A fresh copy (re-injected after an extension reload) replaces any orphan.
+  document.dispatchEvent(new CustomEvent('redline:takeover'));
+  const life = new AbortController();
+  const on = (target, type, fn, opts = {}) => target.addEventListener(type, fn, { ...opts, signal: life.signal });
+  on(document, 'redline:takeover', () => teardown(), { once: true });
+
+  const KEY = 'session';
+  const MAX_EDGE = 2000; // px; longer screenshots are scaled down (Claude downsizes beyond this anyway)
+  const isMac = /Mac|iPhone|iPad/.test(navigator.platform);
+  const IS_EXTENSION_PAGE = location.protocol === 'chrome-extension:';
+
+  let session = null; // { id, folder, createdAt, items: [...] }
+  let mode = 'idle'; // idle | picking | capturing | composing
+  let sheetOpen = false;
+  let shortcutLabel = isMac ? '⌘⇧S' : 'Ctrl+Shift+S';
+  let myTabId = null;
+  const pointer = { x: -1, y: -1 };
+  const imageCache = new Map(); // item id → data URL
+
+  // -------------------------------------------------------------------------
+  // Plumbing
+
+  function send(msg) {
+    return new Promise((resolve, reject) => {
+      if (!chrome.runtime?.id) return teardown(), reject(new Error('Redline was reloaded; refresh the page'));
+      chrome.runtime.sendMessage(msg, (res) => {
+        const err = chrome.runtime.lastError;
+        if (err) reject(new Error(err.message));
+        else if (res?.error) reject(new Error(res.error));
+        else resolve(res);
+      });
+    });
+  }
+
+  const pageKey = () => location.origin + location.pathname + location.search;
+  const uid = () => crypto.randomUUID();
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const frames = (n = 2) => new Promise((r) => (function tick(i) { i ? requestAnimationFrame(() => tick(i - 1)) : r(); })(n));
+  const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+  function stamp(d = new Date()) {
+    const p = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}`;
+  }
+
+  async function readSession() {
+    return (await chrome.storage.local.get(KEY))[KEY] ?? null;
+  }
+
+  // Read-modify-write against storage (another tab may have changed it).
+  async function mutate(fn) {
+    const next = (await readSession()) ?? { id: uid(), folder: stamp(), createdAt: Date.now(), items: [] };
+    fn(next);
+    session = next;
+    render();
+    await chrome.storage.local.set({ [KEY]: next });
+  }
+
+  function onStorage(changes, area) {
+    if (area !== 'local' || !(KEY in changes)) return;
+    session = changes[KEY].newValue ?? null;
+    render();
+  }
+
+  // -------------------------------------------------------------------------
+  // Describing what was picked (goes into the prompt for Claude)
+
+  const UTILITY = /^(-?(m|p)[xytrbl]?-|flex|grid|block|inline|hidden|contents|items-|justify-|content-|self-|place-|gap-|space-|w-|h-|min-|max-|size-|text-|font-|leading-|tracking-|bg-|from-|to-|via-|border|rounded|shadow|ring|outline|opacity-|absolute|relative|fixed|sticky|static|inset|top-|left-|right-|bottom-|z-|overflow|object-|aspect-|order-|col-|row-|basis-|grow|shrink|transition|duration-|ease-|delay-|animate-|cursor-|select-|pointer-|uppercase|lowercase|capitalize|italic|underline|truncate|whitespace-|break-|container|sr-only|visible|invisible|transform|translate-|scale-|rotate-|fill-|stroke-)/;
+
+  function classesOf(el) {
+    const ok = [...el.classList].filter((c) => c.length <= 40 && !/[:[\]/()!@]/.test(c) && !/\d{5,}/.test(c));
+    const semantic = ok.filter((c) => !UTILITY.test(c.replace(/^tw-/, '')));
+    return (semantic.length ? semantic : ok).slice(0, 2);
+  }
+
+  function describe(el) {
+    let s = el.tagName.toLowerCase();
+    if (el.id && el.id.length <= 60 && !/\s/.test(el.id)) return `${s}#${el.id}`;
+    const cls = classesOf(el);
+    return cls.length ? `${s}.${cls.join('.')}` : s;
+  }
+
+  // Readable path for humans and Claude: up to 4 levels, stopping at an id.
+  // When no ancestor in the path has an id, the nearest one above is added as
+  // context (on Shopify that's the section, e.g. #shopify-section-…__hero).
+  function readablePath(el) {
+    const parts = [];
+    let n = el;
+    for (; n?.nodeType === 1 && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+      parts.unshift(describe(n));
+      if ((n !== el && n.id) || parts.length === 4) break;
+    }
+    const anchored = parts.length > 1 && parts[0].includes('#');
+    const above = !anchored && n?.parentElement?.closest('[id]');
+    if (above && above !== document.body && above !== document.documentElement) parts.unshift(`#${above.id} …`);
+    return parts.join(' > ') || el.tagName.toLowerCase();
+  }
+
+  // Exact path, used only to find the element again for its pin.
+  function exactPath(el) {
+    const parts = [];
+    for (let n = el; n?.nodeType === 1 && n !== document.documentElement; n = n.parentElement) {
+      if (n.id && document.querySelectorAll(`#${CSS.escape(n.id)}`).length === 1) {
+        parts.unshift(`#${CSS.escape(n.id)}`);
+        break;
+      }
+      const parent = n.parentElement;
+      const tag = n.tagName.toLowerCase();
+      if (!parent) break;
+      const same = [...parent.children].filter((c) => c.tagName === n.tagName);
+      parts.unshift(same.length > 1 ? `${tag}:nth-of-type(${same.indexOf(n) + 1})` : tag);
+    }
+    return parts.join(' > ');
+  }
+
+  function textOf(el) {
+    if (el === document.body || el === document.documentElement) return '';
+    const raw =
+      el.getAttribute?.('aria-label') ||
+      (el.tagName === 'IMG' && (el.alt || el.src.split('/').pop().split('?')[0])) ||
+      ((el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && (el.value || el.placeholder)) ||
+      el.innerText ||
+      '';
+    const text = raw.replace(/\s+/g, ' ').trim();
+    return text.length > 90 ? `${text.slice(0, 88)}…` : text;
+  }
+
+  function isFixed(el) {
+    for (let n = el; n && n !== document.body && n !== document.documentElement; n = n.parentElement) {
+      const pos = getComputedStyle(n).position;
+      if (pos === 'fixed' || pos === 'sticky') return true;
+    }
+    return false;
+  }
+
+  function elementAt(x, y) {
+    let el = document.elementsFromPoint(x, y).find((n) => n !== host && n !== pinsHost);
+    // Look inside open shadow roots (web components).
+    while (el?.shadowRoot) {
+      const inner = el.shadowRoot.elementFromPoint(x, y);
+      if (!inner || inner === el) break;
+      el = inner;
+    }
+    return el ?? null;
+  }
+
+  // -------------------------------------------------------------------------
+  // UI shell. The host is a manual popover so it renders in the top layer, above
+  // the page's own modals and popovers.
+
+  let host = null;
+  let root = null;
+  const $ = {};
+
+  const HOST_STYLE =
+    'all:initial!important;position:fixed!important;inset:0!important;width:auto!important;height:auto!important;' +
+    'max-width:none!important;max-height:none!important;margin:0!important;padding:0!important;border:0!important;' +
+    'background:transparent!important;overflow:visible!important;display:block!important;pointer-events:none!important;' +
+    'z-index:2147483647!important;color-scheme:light dark!important;';
+
+  function ensureUI() {
+    if (host) {
+      if (!host.isConnected) raise();
+      return;
+    }
+    host = document.createElement('redline-ui');
+    host.setAttribute('popover', 'manual');
+    host.style.cssText = HOST_STYLE;
+    root = host.attachShadow({ mode: 'open' });
+    root.innerHTML = `<style>${STYLES}</style>${TEMPLATE}`;
+    for (const el of root.querySelectorAll('[data-ref]')) $[el.dataset.ref] = el;
+    raise();
+    wireUI();
+    send({ type: 'shortcut' })
+      .then(({ shortcut }) => setShortcut(shortcut))
+      .catch(() => {});
+  }
+
+  // An open modal <dialog> makes everything outside it inert, our top-layer
+  // popover included. Living inside the dialog keeps the composer typeable.
+  function topModal() {
+    const open = [...document.querySelectorAll('dialog[open]')].filter((d) => d.matches(':modal'));
+    return open.at(-1) ?? null;
+  }
+
+  function raise() {
+    if (!host) return;
+    const modal = topModal();
+    const parent = modal ?? document.documentElement;
+    if (host.parentNode !== parent) {
+      parent.append(host);
+      modal?.addEventListener('close', () => host?.parentNode === modal && raise(), { once: true });
+    }
+    try {
+      if (host.matches(':popover-open')) host.hidePopover();
+      host.showPopover();
+    } catch {
+      // No popover support or detached; z-index still applies.
+    }
+  }
+
+  function setShortcut(label) {
+    shortcutLabel = label || '';
+    for (const el of root.querySelectorAll('[data-shortcut]')) {
+      el.textContent = shortcutLabel || 'no shortcut';
+    }
+    $.dockCapture.title = shortcutLabel ? `Capture (${shortcutLabel})` : 'Capture';
+  }
+
+  function setHidden(hidden) {
+    for (const h of [host, pinsHost]) h?.style.setProperty('visibility', hidden ? 'hidden' : 'visible', 'important');
+  }
+
+  // Keep keystrokes typed into Redline away from the page's own shortcuts.
+  function isolate(rootNode) {
+    for (const type of ['keydown', 'keyup', 'keypress', 'input', 'paste', 'copy', 'cut', 'focusin', 'focusout', 'wheel']) {
+      rootNode.addEventListener(type, (e) => e.stopPropagation(), { passive: type === 'wheel' });
+    }
+  }
+
+  function wireUI() {
+    isolate(root);
+    root.addEventListener('click', (e) => {
+      const act = e.target.closest('[data-act]')?.dataset.act;
+      if (act) actions[act]?.(e);
+    });
+
+    // Composer
+    $.input.addEventListener('keydown', (e) => {
+      if (e.isComposing) return;
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        commit({ next: e.metaKey || e.ctrlKey });
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        dismissComposer();
+      }
+    });
+    $.input.addEventListener('input', () => {
+      composer && (composer.armed = false);
+      $.cmp.classList.remove('armed');
+      placeComposer();
+    });
+
+    // Sheet: notes save as you type
+    $.list.addEventListener('input', (e) => {
+      const ta = e.target.closest('.card-note');
+      if (!ta) return;
+      const id = ta.closest('.card').dataset.id;
+      clearTimeout(ta._save);
+      ta._save = setTimeout(() => saveNote(id, ta.value), 250);
+    });
+    $.list.addEventListener('focusout', (e) => {
+      const ta = e.target.closest?.('.card-note');
+      if (ta?._save) clearTimeout(ta._save), saveNote(ta.closest('.card').dataset.id, ta.value);
+    });
+    $.list.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') e.target.blur?.();
+    });
+  }
+
+  const actions = {
+    capture: () => startPicking(),
+    stop: () => stopPicking(),
+    save: () => commit({ next: false }),
+    next: () => commit({ next: true }),
+    discard: () => closeComposer(),
+    delete: () => {
+      if (!composer || composer.isNew) return;
+      const id = composer.item.id;
+      closeComposer();
+      removeItem(id);
+    },
+    review: () => openSheet(),
+    close: () => closeSheet(),
+    copy: (e) => copyAll(e.target.closest('button')),
+    clear: () => clearSession(),
+    shortcuts: () => send({ type: 'openShortcuts' }).catch(() => {}),
+    zoom: (e) => openLightbox(e.target.closest('.card').dataset.id),
+    unzoom: () => closeLightbox(),
+    remove: (e) => removeItem(e.target.closest('.card').dataset.id),
+    goto: (e) => {
+      e.preventDefault();
+      const id = e.target.closest('.card').dataset.id;
+      const item = session?.items.find((i) => i.id === id);
+      if (!item) return;
+      if (item.url !== pageKey()) return window.open(item.url, '_blank');
+      closeSheet();
+      showItem(item);
+    },
+    toast: () => toastAction?.(),
+  };
+
+  // -------------------------------------------------------------------------
+  // Picking: hover highlights an element, click captures it, drag captures an
+  // area, Space captures the whole screen. Page hover states stay live, so open
+  // menus and tooltips can be captured too.
+
+  let pickAbort = null;
+  const pick = { base: null, el: null, trail: [], drag: null, raf: 0 };
+
+  function startPicking() {
+    if (mode === 'composing') return $.input.focus();
+    if (mode !== 'idle') return;
+    closeSheet();
+    closeLightbox();
+    mode = 'picking';
+    ensureUI();
+    raise();
+    send({ type: 'ping' }).catch(() => {}); // wake the worker so the capture is instant
+
+    Object.assign(pick, { base: null, el: null, trail: [], drag: null });
+    pickAbort = new AbortController();
+    const opts = { capture: true, passive: false, signal: pickAbort.signal };
+    addEventListener('pointermove', onPickMove, opts);
+    addEventListener('pointerdown', onPickDown, opts);
+    addEventListener('pointerup', onPickUp, opts);
+    for (const type of ['mousedown', 'mouseup', 'click', 'dblclick', 'auxclick', 'contextmenu', 'dragstart', 'selectstart', 'touchstart']) {
+      addEventListener(type, swallow, opts);
+    }
+    addEventListener('keydown', onPickKey, opts);
+    addEventListener('scroll', () => pick.el && !pick.drag && drawHighlight(pick.el), { capture: true, passive: true, signal: pickAbort.signal });
+
+    setCursor(true);
+    $.hud.classList.add('on');
+    $.hud.classList.toggle('top', pointer.y > innerHeight - 110);
+    pinsLayer?.classList.add('picking');
+    render();
+    if (pointer.x >= 0) hoverAt(pointer.x, pointer.y);
+  }
+
+  function stopPicking() {
+    if (mode !== 'picking') return;
+    mode = 'idle';
+    cleanupPicking();
+    render();
+  }
+
+  function cleanupPicking() {
+    pickAbort?.abort();
+    pickAbort = null;
+    cancelAnimationFrame(pick.raf);
+    setCursor(false);
+    $.hud?.classList.remove('on', 'dragging');
+    $.hl?.classList.remove('on');
+    $.tag?.classList.remove('on');
+    $.rg?.classList.remove('on');
+    pinsLayer?.classList.remove('picking');
+  }
+
+  function setCursor(onOff) {
+    let style = document.getElementById('redline-cursor');
+    if (!onOff) return style?.remove();
+    if (style) return;
+    style = document.createElement('style');
+    style.id = 'redline-cursor';
+    style.textContent = 'html,html *{cursor:crosshair!important;user-select:none!important;-webkit-user-select:none!important}';
+    (document.head ?? document.documentElement).append(style);
+  }
+
+  const ours = (e) => e.target === host || e.target === pinsHost;
+
+  function swallow(e) {
+    if (ours(e)) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }
+
+  // The click that follows a capturing pointerup must not reach the page (it
+  // would follow the link you just pointed at).
+  function swallowNextClick() {
+    const kill = (e) => !ours(e) && (e.preventDefault(), e.stopImmediatePropagation());
+    addEventListener('click', kill, { capture: true, signal: life.signal });
+    setTimeout(() => removeEventListener('click', kill, { capture: true }), 500);
+  }
+
+  function onPickMove(e) {
+    if (ours(e)) {
+      $.hl.classList.remove('on');
+      $.tag.classList.remove('on');
+      return;
+    }
+    const { clientX: x, clientY: y } = e;
+    if (pick.drag) {
+      const d = pick.drag;
+      if (!d.active && Math.hypot(x - d.x, y - d.y) > 5) {
+        d.active = true;
+        $.hl.classList.remove('on');
+        $.tag.classList.remove('on');
+        $.rg.classList.add('on');
+        $.hud.classList.add('dragging');
+      }
+      if (d.active) drawRegion(d.x, d.y, x, y);
+      return;
+    }
+    cancelAnimationFrame(pick.raf);
+    pick.raf = requestAnimationFrame(() => hoverAt(x, y));
+    $.hud.classList.toggle('top', y > innerHeight - 110 && Math.abs(x - innerWidth / 2) < 320);
+  }
+
+  function hoverAt(x, y) {
+    const el = elementAt(x, y);
+    if (!el) return;
+    if (el === pick.base) return $.hl.classList.contains('on') || drawHighlight(pick.el);
+    pick.base = pick.el = el;
+    pick.trail = [];
+    drawHighlight(el);
+  }
+
+  function onPickDown(e) {
+    if (ours(e)) return;
+    swallow(e);
+    if (e.button !== 0) return;
+    pick.drag = { x: e.clientX, y: e.clientY, active: false };
+  }
+
+  function onPickUp(e) {
+    if (ours(e)) return;
+    swallow(e);
+    const d = pick.drag;
+    pick.drag = null;
+    if (!d || e.button !== 0) return;
+    swallowNextClick();
+    hoverAt(e.clientX, e.clientY); // a fast click can land before the hover frame
+    if (d.active) {
+      $.rg.classList.remove('on');
+      $.hud.classList.remove('dragging');
+      const r = rectFromPoints(d.x, d.y, e.clientX, e.clientY);
+      if (r.w >= 8 && r.h >= 8) return captureArea(r);
+      return;
+    }
+    if (pick.el) captureElement(pick.el);
+  }
+
+  function onPickKey(e) {
+    if (ours(e)) return;
+    const k = e.key;
+    if (k === 'Escape') stopPicking();
+    else if (k === ' ') captureScreen();
+    else if (k === 'Enter' && pick.el) captureElement(pick.el);
+    else if (k === 'ArrowUp' && pick.el?.parentElement && pick.el.parentElement !== document.documentElement) {
+      pick.trail.push(pick.el);
+      pick.el = pick.el.parentElement;
+      drawHighlight(pick.el);
+    } else if (k === 'ArrowDown' && pick.trail.length) {
+      pick.el = pick.trail.pop();
+      drawHighlight(pick.el);
+    } else return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }
+
+  function drawHighlight(el) {
+    const r = el.getBoundingClientRect();
+    const radius = parseFloat(getComputedStyle(el).borderTopLeftRadius) || 0;
+    Object.assign($.hl.style, {
+      transform: `translate(${r.left}px, ${r.top}px)`,
+      width: `${r.width}px`,
+      height: `${r.height}px`,
+      borderRadius: `${Math.min(radius, r.height / 2, r.width / 2)}px`,
+    });
+    $.hl.classList.add('on');
+
+    $.tagName.textContent = describe(el);
+    $.tagSize.textContent = `${Math.round(r.width)} × ${Math.round(r.height)}`;
+    $.tag.classList.add('on');
+    const tw = $.tag.offsetWidth;
+    const tx = clamp(r.left, 6, innerWidth - tw - 6);
+    let ty = r.top - 28;
+    if (ty < 6) ty = r.bottom + 6 < innerHeight - 28 ? r.bottom + 6 : clamp(r.top, 0, innerHeight) + 6;
+    $.tag.style.transform = `translate(${tx}px, ${ty}px)`;
+  }
+
+  function rectFromPoints(x0, y0, x1, y1) {
+    const x = clamp(Math.min(x0, x1), 0, innerWidth);
+    const y = clamp(Math.min(y0, y1), 0, innerHeight);
+    return { x, y, w: clamp(Math.max(x0, x1), 0, innerWidth) - x, h: clamp(Math.max(y0, y1), 0, innerHeight) - y };
+  }
+
+  function drawRegion(x0, y0, x1, y1) {
+    const r = rectFromPoints(x0, y0, x1, y1);
+    Object.assign($.rg.style, { transform: `translate(${r.x}px, ${r.y}px)`, width: `${r.w}px`, height: `${r.h}px` });
+    $.rgSize.textContent = `${Math.round(r.w)} × ${Math.round(r.h)}`;
+    $.rg.classList.toggle('inside', r.y + r.h + 34 > innerHeight);
+  }
+
+  // -------------------------------------------------------------------------
+  // Capture
+
+  const viewportRect = (r) => ({ x: r.left, y: r.top, w: r.width, h: r.height });
+
+  function intersect(r) {
+    const x = clamp(r.x, 0, innerWidth);
+    const y = clamp(r.y, 0, innerHeight);
+    return { x, y, w: clamp(r.x + r.w, 0, innerWidth) - x, h: clamp(r.y + r.h, 0, innerHeight) - y };
+  }
+
+  // Element shots get breathing room so Claude sees where the element sits.
+  function contextCrop(r) {
+    const vw = innerWidth;
+    const vh = innerHeight;
+    let x0 = r.x - 24;
+    let y0 = r.y - 24;
+    let x1 = r.x + r.w + 24;
+    let y1 = r.y + r.h + 24;
+    const grow = (a, b, min) => {
+      if (b - a >= min) return [a, b];
+      const c = (a + b) / 2;
+      return [c - min / 2, c + min / 2];
+    };
+    [x0, x1] = grow(x0, x1, Math.min(420, vw));
+    [y0, y1] = grow(y0, y1, Math.min(260, vh));
+    const shift = (a, b, max) => (a < 0 ? [0, Math.min(max, b - a)] : b > max ? [Math.max(0, a - (b - max)), max] : [a, b]);
+    [x0, x1] = shift(x0, x1, vw);
+    [y0, y1] = shift(y0, y1, vh);
+    return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+  }
+
+  function captureElement(el) {
+    const r = el.getBoundingClientRect();
+    const rect = viewportRect(r);
+    const visible = intersect(rect);
+    if (visible.w < 2 || visible.h < 2) return;
+    const fixed = isFixed(el);
+    capture({
+      kind: 'element',
+      spot: visible,
+      crop: contextCrop(visible),
+      ring: { ...rect, radius: parseFloat(getComputedStyle(el).borderTopLeftRadius) || 0 },
+      fixed,
+      rect: fixed ? rect : { ...rect, x: rect.x + scrollX, y: rect.y + scrollY },
+      css: exactPath(el),
+      target: { label: describe(el), path: readablePath(el), text: textOf(el) },
+    });
+  }
+
+  function captureArea(r) {
+    const center = elementAt(r.x + r.w / 2, r.y + r.h / 2);
+    capture({
+      kind: 'area',
+      spot: r,
+      crop: r,
+      rect: { ...r, x: r.x + scrollX, y: r.y + scrollY },
+      target: center ? { label: describe(center), path: readablePath(center) } : null,
+    });
+  }
+
+  function captureScreen() {
+    const r = { x: 0, y: 0, w: innerWidth, h: innerHeight };
+    capture({ kind: 'screen', spot: r, crop: r, rect: { ...r, x: scrollX, y: scrollY } });
+  }
+
+  async function capture(c) {
+    cleanupPicking();
+    mode = 'capturing';
+    setHidden(true);
+    let shot;
+    try {
+      await frames(2); // let the hidden UI paint out
+      shot = await send({ type: 'capture' });
+    } catch (err) {
+      mode = 'idle';
+      setHidden(false);
+      render();
+      return toast(`Couldn’t capture: ${err.message}`, { error: true });
+    }
+    setHidden(false);
+
+    let image;
+    try {
+      image = await cropShot(shot.dataUrl, c.crop, c.kind === 'element' ? c.ring : null);
+    } catch (err) {
+      mode = 'idle';
+      render();
+      return toast(`Couldn’t capture: ${err.message}`, { error: true });
+    }
+    flash(c.spot);
+    const item = {
+      id: uid(),
+      kind: c.kind,
+      note: '',
+      url: pageKey(),
+      title: document.title.trim(),
+      vw: innerWidth,
+      vh: innerHeight,
+      rect: c.rect,
+      fixed: !!c.fixed,
+      css: c.css ?? null,
+      target: c.target ?? null,
+      createdAt: Date.now(),
+    };
+    openComposer({ item, isNew: true, image, spot: c.spot });
+  }
+
+  async function cropShot(dataUrl, crop, ring) {
+    const img = new Image();
+    img.src = dataUrl;
+    await img.decode();
+    const s = img.naturalWidth / innerWidth; // device pixels per CSS pixel
+    const sw = Math.max(1, Math.round(crop.w * s));
+    const sh = Math.max(1, Math.round(crop.h * s));
+    const k = Math.min(1, MAX_EDGE / Math.max(sw, sh));
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.round(sw * k);
+    canvas.height = Math.round(sh * k);
+    const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, Math.round(crop.x * s), Math.round(crop.y * s), sw, sh, 0, 0, canvas.width, canvas.height);
+
+    // Outline the picked element in red unless it already fills the frame.
+    if (ring && ring.w * ring.h < crop.w * crop.h * 0.8) {
+      const f = s * k;
+      const lw = Math.max(2, 2.5 * f);
+      const gap = 3;
+      const x = clamp((ring.x - crop.x - gap) * f, lw / 2, canvas.width - lw / 2);
+      const y = clamp((ring.y - crop.y - gap) * f, lw / 2, canvas.height - lw / 2);
+      const x2 = clamp((ring.x + ring.w - crop.x + gap) * f, lw / 2, canvas.width - lw / 2);
+      const y2 = clamp((ring.y + ring.h - crop.y + gap) * f, lw / 2, canvas.height - lw / 2);
+      ctx.save();
+      ctx.strokeStyle = '#FF3B30';
+      ctx.lineWidth = lw;
+      ctx.shadowColor = 'rgba(0,0,0,0.25)';
+      ctx.shadowBlur = 3 * f;
+      ctx.beginPath();
+      ctx.roundRect(x, y, x2 - x, y2 - y, Math.min((ring.radius + gap) * f, (x2 - x) / 2, (y2 - y) / 2));
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    const blob = await new Promise((r) => canvas.toBlob(r, 'image/png'));
+    const url = await new Promise((r) => {
+      const fr = new FileReader();
+      fr.onload = () => r(fr.result);
+      fr.readAsDataURL(blob);
+    });
+    return url;
+  }
+
+  function flash(r) {
+    const el = document.createElement('div');
+    el.className = 'flash';
+    Object.assign(el.style, { left: `${r.x}px`, top: `${r.y}px`, width: `${r.w}px`, height: `${r.h}px` });
+    $.r.append(el);
+    setTimeout(() => el.remove(), 600);
+  }
+
+  // -------------------------------------------------------------------------
+  // Composer: the note field that appears next to what you captured.
+
+  let composer = null; // { item, isNew, image, spot, armed, scroll }
+  let composerAbort = null;
+
+  function openComposer({ item, isNew, image, spot }) {
+    mode = 'composing';
+    ensureUI();
+    raise();
+    composer = { item, isNew, image, spot, armed: false, scroll: { x: scrollX, y: scrollY } };
+
+    const index = isNew ? (session?.items.length ?? 0) : session.items.findIndex((i) => i.id === item.id);
+    $.cmpNum.textContent = index + 1;
+    $.cmpWhat.textContent =
+      item.kind === 'screen' ? 'Whole screen' : item.kind === 'area' ? `Area · ${Math.round(spot.w)} × ${Math.round(spot.h)}` : item.target?.label ?? 'Element';
+    $.cmpThumb.hidden = isNew;
+    if (!isNew) $.cmpThumb.src = image ?? '';
+    $.input.value = item.note ?? '';
+    $.cmpDelete.hidden = isNew;
+    $.cmpSave.lastChild.textContent = isNew ? 'Save' : 'Done';
+    $.cmpNext.hidden = !isNew;
+    $.cmp.classList.remove('armed', 'shake');
+    $.cmp.classList.toggle('edit', !isNew);
+
+    $.spot.classList.toggle('screen', item.kind === 'screen');
+    Object.assign($.spot.style, { left: `${spot.x}px`, top: `${spot.y}px`, width: `${spot.w}px`, height: `${spot.h}px`, transform: '' });
+    $.spot.classList.add('on');
+    $.cmp.classList.add('on');
+    placeComposer(true);
+    $.input.focus({ preventScroll: true });
+    $.input.setSelectionRange($.input.value.length, $.input.value.length);
+    render();
+
+    // Follow the page if it scrolls underneath (fixed elements stay put).
+    composerAbort = new AbortController();
+    addEventListener(
+      'scroll',
+      () => {
+        if (!composer || item.fixed) return;
+        const dx = composer.scroll.x - scrollX;
+        const dy = composer.scroll.y - scrollY;
+        $.spot.style.transform = `translate(${dx}px, ${dy}px)`;
+        $.cmp.style.translate = `${dx}px ${dy}px`;
+      },
+      { passive: true, signal: composerAbort.signal },
+    );
+    addEventListener('resize', () => placeComposer(), { signal: composerAbort.signal });
+    // Clicking the dimmed page outside the composer counts as "cancel".
+    addEventListener(
+      'pointerdown',
+      (e) => {
+        if (ours(e)) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        swallowNextClick();
+        dismissComposer();
+      },
+      { capture: true, signal: composerAbort.signal },
+    );
+  }
+
+  function placeComposer(initial = false) {
+    if (!composer) return;
+    const { spot, item } = composer;
+    const W = $.cmp.offsetWidth;
+    const H = $.cmp.offsetHeight;
+    const vw = innerWidth;
+    const vh = innerHeight;
+    const gap = 14;
+    const m = 12;
+    let x;
+    let y;
+    let origin;
+    if (item.kind === 'screen') {
+      x = (vw - W) / 2;
+      y = vh - H - 40;
+      origin = 'bottom center';
+    } else if (spot.x + spot.w + gap + W + m <= vw) {
+      x = spot.x + spot.w + gap;
+      y = spot.y;
+      origin = 'left top';
+    } else if (spot.x - gap - W - m >= 0) {
+      x = spot.x - gap - W;
+      y = spot.y;
+      origin = 'right top';
+    } else if (spot.y + spot.h + gap + H + m <= vh) {
+      x = spot.x;
+      y = spot.y + spot.h + gap;
+      origin = 'left top';
+    } else if (spot.y - gap - H - m >= 0) {
+      x = spot.x;
+      y = spot.y - gap - H;
+      origin = 'left bottom';
+    } else {
+      x = vw - W - 24;
+      y = vh - H - 24;
+      origin = 'right bottom';
+    }
+    if (initial) $.cmp.style.transformOrigin = origin;
+    $.cmp.style.left = `${clamp(x, m, vw - W - m)}px`;
+    $.cmp.style.top = `${clamp(y, m, vh - H - m)}px`;
+  }
+
+  function dismissComposer() {
+    if (!composer) return;
+    const changed = $.input.value.trim() !== (composer.item.note ?? '').trim();
+    if (changed && $.input.value.trim() && !composer.armed) {
+      composer.armed = true;
+      $.cmp.classList.add('armed');
+      shake();
+      return;
+    }
+    closeComposer();
+  }
+
+  function closeComposer() {
+    composerAbort?.abort();
+    $.spot.classList.remove('on');
+    $.cmp.classList.remove('on', 'armed');
+    $.cmp.style.translate = '';
+    composer = null;
+    mode = 'idle';
+    $.input.blur();
+    render();
+  }
+
+  function shake() {
+    $.cmp.classList.remove('shake');
+    void $.cmp.offsetWidth;
+    $.cmp.classList.add('shake');
+  }
+
+  async function commit({ next }) {
+    if (!composer) return;
+    const note = $.input.value.trim();
+    if (!note) return shake(), $.input.focus();
+    const { item, isNew, image } = composer;
+    closeComposer();
+    if (next) startPicking();
+
+    try {
+      if (isNew) {
+        imageCache.set(item.id, image);
+        await send({ type: 'putImage', id: item.id, dataUrl: image });
+        await mutate((s) => s.items.push({ ...item, note }));
+        bumpDock();
+      } else {
+        await mutate((s) => {
+          const it = s.items.find((i) => i.id === item.id);
+          if (it) it.note = note;
+        });
+      }
+    } catch (err) {
+      toast(`Couldn’t save: ${err.message}`, { error: true });
+    }
+  }
+
+  async function saveNote(id, value) {
+    const it = session?.items.find((i) => i.id === id);
+    if (!it || it.note === value) return;
+    await mutate((s) => {
+      const target = s.items.find((i) => i.id === id);
+      if (target) target.note = value;
+    });
+  }
+
+  async function removeItem(id) {
+    const index = session?.items.findIndex((i) => i.id === id) ?? -1;
+    if (index < 0) return;
+    const item = session.items[index];
+    await mutate((s) => (s.items = s.items.filter((i) => i.id !== id)));
+    toast('Note deleted', {
+      action: 'Undo',
+      onAction: () => mutate((s) => s.items.splice(Math.min(index, s.items.length), 0, item)),
+    });
+  }
+
+  async function getImage(id) {
+    if (!imageCache.has(id)) {
+      const found = await send({ type: 'getImages', ids: [id] }).catch(() => ({}));
+      if (found[id]) imageCache.set(id, found[id]);
+    }
+    return imageCache.get(id) ?? null;
+  }
+
+  // Scroll a note's element into view and open it for editing.
+  async function showItem(item) {
+    let r = livePinRect(item) ?? item.rect;
+    if (!item.fixed) {
+      const top = r.y - scrollY;
+      if (top < 0 || top + Math.min(r.h, innerHeight / 2) > innerHeight) {
+        scrollTo({ top: Math.max(0, r.y - innerHeight / 3), behavior: 'instant' });
+        await frames(1);
+      }
+      r = { ...r, x: r.x - scrollX, y: r.y - scrollY };
+    }
+    openComposer({ item, isNew: false, image: await getImage(item.id), spot: intersectOrSelf(r) });
+  }
+
+  function intersectOrSelf(r) {
+    const i = intersect(r);
+    return i.w > 1 && i.h > 1 ? i : r;
+  }
+
+  // -------------------------------------------------------------------------
+  // Copy for Claude
+
+  async function copyAll(button) {
+    const count = session?.items.length ?? 0;
+    if (!count) return toast('Nothing to copy yet');
+    button?.classList.add('busy');
+    try {
+      const { text } = await send({ type: 'export' });
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        await send({ type: 'copyText', text });
+      }
+      for (const b of root.querySelectorAll('[data-act="copy"]')) {
+        b.classList.add('done');
+        setTimeout(() => b.classList.remove('done'), 1600);
+      }
+      toast(`Copied ${plural(count, 'note')}. Paste into Claude.`, { ok: true, action: 'New session', onAction: () => clearSession() });
+    } catch (err) {
+      toast(`Couldn’t copy: ${err.message}`, { error: true });
+    } finally {
+      button?.classList.remove('busy');
+    }
+  }
+
+  async function clearSession() {
+    const previous = await readSession();
+    if (!previous) return;
+    closeSheet();
+    await chrome.storage.local.remove(KEY);
+    session = null;
+    render();
+    toast('New session started', {
+      action: 'Undo',
+      onAction: () => chrome.storage.local.set({ [KEY]: previous }),
+      onExpire: () => send({ type: 'gc' }).catch(() => {}),
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // Review sheet
+
+  function openSheet() {
+    if (mode === 'picking') stopPicking();
+    if (mode !== 'idle') return;
+    sheetOpen = true;
+    ensureUI();
+    raise();
+    render();
+    requestAnimationFrame(() => $.sheet.classList.add('on'));
+    on(window, 'keydown', onSheetKey, { capture: true });
+  }
+
+  function onSheetKey(e) {
+    if (!sheetOpen) return;
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    if (lightboxOpen) closeLightbox();
+    else closeSheet();
+  }
+
+  function closeSheet() {
+    if (!sheetOpen) return;
+    sheetOpen = false;
+    removeEventListener('keydown', onSheetKey, { capture: true });
+    $.sheet.classList.remove('on');
+    root.activeElement?.blur();
+    render();
+  }
+
+  function renderSheet() {
+    const items = session?.items ?? [];
+    const pages = new Set(items.map((i) => i.url)).size;
+    $.sheetSub.textContent = items.length
+      ? `${plural(items.length, 'note')}${pages > 1 ? ` across ${pages} pages` : ''}`
+      : 'Nothing captured yet';
+    $.empty.hidden = items.length > 0;
+    $.list.hidden = !items.length;
+    for (const b of root.querySelectorAll('.sh-foot button')) b.disabled = !items.length;
+
+    const cards = new Map([...$.list.children].map((c) => [c.dataset.id, c]));
+    items.forEach((item, i) => {
+      let card = cards.get(item.id);
+      cards.delete(item.id);
+      if (!card) card = makeCard(item);
+      card.querySelector('.num').textContent = i + 1;
+      const ta = card.querySelector('.card-note');
+      if (root.activeElement !== ta && ta.value !== item.note) ta.value = item.note;
+      const img = card.querySelector('img');
+      const src = imageCache.get(item.id);
+      if (src && img.getAttribute('src') !== src) img.src = src;
+      if ($.list.children[i] !== card) $.list.insertBefore(card, $.list.children[i] ?? null);
+    });
+    for (const card of cards.values()) card.remove();
+    loadThumbs(items);
+  }
+
+  const requested = new Set(); // ask the worker once per thumbnail
+  function loadThumbs(items) {
+    const ids = items.map((i) => i.id).filter((id) => !imageCache.has(id) && !requested.has(id));
+    if (!ids.length) return;
+    ids.forEach((id) => requested.add(id));
+    send({ type: 'getImages', ids })
+      .then((found) => {
+        for (const [id, url] of Object.entries(found)) imageCache.set(id, url);
+        if (sheetOpen) renderSheet();
+      })
+      .catch(() => {});
+  }
+
+  function makeCard(item) {
+    const card = document.createElement('article');
+    card.className = 'card';
+    card.dataset.id = item.id;
+    const where = item.url === pageKey() ? 'This page' : shortUrl(item.url);
+    const what = item.kind === 'screen' ? 'Whole screen' : item.kind === 'area' ? 'Area' : item.target?.label ?? 'Element';
+    card.innerHTML = `
+      <div class="card-shot" data-act="zoom">
+        <img alt="">
+        <span class="num"></span>
+        <button class="card-del" data-act="remove" title="Delete note">${ICON.trash}</button>
+      </div>
+      <textarea class="card-note" rows="1" spellcheck="true" placeholder="What should change?"></textarea>
+      <div class="card-meta">
+        <span class="mono"></span>
+        <a href="#" data-act="goto"></a>
+      </div>`;
+    card.querySelector('.mono').textContent = what;
+    const link = card.querySelector('a');
+    link.textContent = where;
+    link.title = item.url === pageKey() ? 'Show on page' : item.url;
+    return card;
+  }
+
+  function shortUrl(url) {
+    try {
+      const u = new URL(url);
+      return (u.pathname + u.search).replace(/^\/$/, u.host) || u.host;
+    } catch {
+      return url;
+    }
+  }
+
+  let lightboxOpen = false;
+  function openLightbox(id) {
+    const src = imageCache.get(id);
+    if (!src) return;
+    lightboxOpen = true;
+    $.lbImg.src = src;
+    $.lb.hidden = false;
+    requestAnimationFrame(() => $.lb.classList.add('on'));
+  }
+
+  function closeLightbox() {
+    if (!lightboxOpen) return;
+    lightboxOpen = false;
+    $.lb.classList.remove('on');
+    setTimeout(() => !lightboxOpen && ($.lb.hidden = true), 200);
+  }
+
+  // -------------------------------------------------------------------------
+  // Toasts
+
+  let toastTimer = 0;
+  let toastAction = null;
+  let toastExpire = null;
+
+  function toast(text, { action, onAction, onExpire, ok, error } = {}) {
+    ensureUI();
+    clearTimeout(toastTimer);
+    toastExpire?.();
+    $.toastText.textContent = text;
+    $.toastIcon.innerHTML = ok ? ICON.check : error ? ICON.warn : '';
+    $.toastIcon.hidden = !(ok || error);
+    $.toast.classList.toggle('error', !!error);
+    $.toastBtn.hidden = !action;
+    $.toastBtn.textContent = action ?? '';
+    toastExpire = onExpire ?? null;
+    toastAction = onAction
+      ? () => {
+          toastExpire = null;
+          hideToast();
+          onAction();
+        }
+      : null;
+    $.toast.classList.add('on');
+    toastTimer = setTimeout(hideToast, action ? 6000 : 3200);
+  }
+
+  function hideToast() {
+    clearTimeout(toastTimer);
+    $.toast.classList.remove('on');
+    const expire = toastExpire;
+    toastExpire = null;
+    expire?.();
+  }
+
+  // -------------------------------------------------------------------------
+  // Render: dock + pins + sheet from the current session.
+
+  function render() {
+    const items = session?.items ?? [];
+    if (host || items.length || mode !== 'idle' || sheetOpen) {
+      ensureUI();
+      const showDock = items.length > 0 && mode === 'idle' && !sheetOpen;
+      $.dock.classList.toggle('on', showDock);
+      $.dockCount.textContent = items.length;
+      $.dockLabel.textContent = items.length === 1 ? 'note' : 'notes';
+      if (sheetOpen) renderSheet();
+    }
+    renderPins();
+    pinsLayer?.classList.toggle('busy', mode !== 'idle' || sheetOpen);
+  }
+
+  function bumpDock() {
+    if (!$.dockCount) return;
+    $.dockCount.classList.remove('bump');
+    void $.dockCount.offsetWidth;
+    $.dockCount.classList.add('bump');
+  }
+
+  // Pins: numbered markers on the page where each note was taken.
+  let pinsHost = null;
+  let pinsLayer = null;
+  const pinEls = new Map();
+
+  function ensurePins() {
+    if (pinsHost) {
+      if (!pinsHost.isConnected) document.documentElement.append(pinsHost);
+      return;
+    }
+    pinsHost = document.createElement('redline-pins');
+    pinsHost.style.cssText =
+      'all:initial!important;position:absolute!important;left:0!important;top:0!important;width:0!important;height:0!important;' +
+      'overflow:visible!important;display:block!important;pointer-events:none!important;z-index:2147483646!important;';
+    const shadow = pinsHost.attachShadow({ mode: 'open' });
+    shadow.innerHTML = `<style>${PIN_CSS}</style><div class="layer"></div>`;
+    pinsLayer = shadow.querySelector('.layer');
+    isolate(shadow);
+    shadow.addEventListener('click', (e) => {
+      const pin = e.target.closest('.p');
+      if (!pin || mode !== 'idle') return;
+      e.preventDefault();
+      const item = session?.items.find((i) => i.id === pin.dataset.id);
+      if (item) closeSheet(), showItem(item);
+    });
+    document.documentElement.append(pinsHost);
+  }
+
+  function renderPins() {
+    const here = pageKey();
+    const mine = (session?.items ?? [])
+      .map((item, i) => [item, i])
+      .filter(([item]) => item.url === here && item.kind !== 'screen');
+    if (!mine.length && !pinsHost) return;
+    ensurePins();
+    const seen = new Set();
+    for (const [item, i] of mine) {
+      seen.add(item.id);
+      let pin = pinEls.get(item.id);
+      if (!pin) {
+        pin = document.createElement('button');
+        pin.className = 'p';
+        pin.dataset.id = item.id;
+        pin.innerHTML = '<span class="n"></span><span class="tip"></span>';
+        pinEls.set(item.id, pin);
+        pinsLayer.append(pin);
+      }
+      pin.firstChild.textContent = i + 1;
+      pin.lastChild.textContent = item.note;
+      placePin(pin, item);
+    }
+    for (const [id, pin] of pinEls) if (!seen.has(id)) pin.remove(), pinEls.delete(id);
+  }
+
+  function findLive(item) {
+    if (!item.css) return null;
+    try {
+      return document.querySelector(item.css);
+    } catch {
+      return null;
+    }
+  }
+
+  // Current rect of a note's element (document coords, or viewport if fixed).
+  function livePinRect(item) {
+    const el = findLive(item);
+    if (!el) return null;
+    const b = el.getBoundingClientRect();
+    if (!b.width && !b.height) return { hidden: true };
+    return item.fixed ? viewportRect(b) : { x: b.left + scrollX, y: b.top + scrollY, w: b.width, h: b.height };
+  }
+
+  function placePin(pin, item) {
+    const live = livePinRect(item);
+    pin.hidden = !!live?.hidden;
+    if (live?.hidden) return;
+    const r = live ?? item.rect;
+    const maxX = (item.fixed ? innerWidth : document.documentElement.scrollWidth) - 14;
+    const x = Math.min(r.x + r.w - 2, maxX);
+    const y = Math.max(r.y + 2, 14);
+    pin.classList.toggle('fixed', !!item.fixed);
+    pin.style.left = `${x}px`;
+    pin.style.top = `${y}px`;
+    pin.classList.toggle('flip', (item.fixed ? x : x - scrollX) > innerWidth - 300);
+  }
+
+  function pulsePin(id) {
+    const pin = pinEls.get(id);
+    if (!pin) return;
+    pin.classList.remove('pulse');
+    void pin.offsetWidth;
+    pin.classList.add('pulse');
+  }
+
+  // -------------------------------------------------------------------------
+  // Lifecycle
+
+  function onMessage(msg, _sender, sendResponse) {
+    if (msg?.target !== 'page') return false;
+    if (IS_EXTENSION_PAGE && msg.tabId != null && myTabId != null && msg.tabId !== myTabId) return false;
+    switch (msg.type) {
+      case 'toggle':
+        if (mode === 'picking') stopPicking();
+        else startPicking();
+        break;
+      case 'review':
+        openSheet();
+        break;
+      case 'copy':
+        copyAll();
+        break;
+      case 'clear':
+        clearSession();
+        break;
+      default:
+        return false;
+    }
+    sendResponse({ ok: true });
+    return false;
+  }
+
+  function teardown() {
+    life.abort();
+    pickAbort?.abort();
+    composerAbort?.abort();
+    setCursor(false);
+    host?.remove();
+    pinsHost?.remove();
+    clearInterval(watch);
+    try {
+      chrome.runtime.onMessage.removeListener(onMessage);
+      chrome.storage.onChanged.removeListener(onStorage);
+    } catch {}
+  }
+
+  on(window, 'pointermove', (e) => ((pointer.x = e.clientX), (pointer.y = e.clientY)), { passive: true, capture: true });
+  on(window, 'resize', () => pinEls.size && renderPins(), { passive: true });
+
+  // SPA navigation and late layout shifts move things around; re-check now and then.
+  let lastUrl = pageKey();
+  const watch = setInterval(() => {
+    if (!chrome.runtime?.id) return teardown();
+    if (pageKey() !== lastUrl) {
+      lastUrl = pageKey();
+      if (mode === 'composing') closeComposer();
+      renderPins();
+    } else if (pinEls.size) renderPins();
+  }, 1200);
+
+  chrome.runtime.onMessage.addListener(onMessage);
+  chrome.storage.onChanged.addListener(onStorage);
+  chrome.tabs?.getCurrent?.((tab) => (myTabId = tab?.id ?? null));
+  readSession().then((s) => {
+    session = s;
+    render();
+  });
+
+  // Exposed for pages that host Redline directly (the welcome page).
+  window.__redline = { start: () => startPicking(), review: () => openSheet(), pulsePin };
+
+  // -------------------------------------------------------------------------
+  // Markup + styles
+
+  const ICON = {
+    capture:
+      '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 7.2V5.5A2.5 2.5 0 0 1 5.5 3h1.7M12.8 3h1.7A2.5 2.5 0 0 1 17 5.5v1.7M17 12.8v1.7a2.5 2.5 0 0 1-2.5 2.5h-1.7M7.2 17H5.5A2.5 2.5 0 0 1 3 14.5v-1.7"/><path d="M10 7v6M7 10h6"/></svg>',
+    close:
+      '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M6 6l8 8M14 6l-8 8"/></svg>',
+    trash:
+      '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 5.5h13M8 5.5V4.2c0-.66.54-1.2 1.2-1.2h1.6c.66 0 1.2.54 1.2 1.2v1.3M5.2 5.5l.75 9.6A2 2 0 0 0 7.94 17h4.12a2 2 0 0 0 2-1.85l.74-9.65"/></svg>',
+    copy:
+      '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><rect x="7" y="7" width="10" height="10" rx="2.4"/><path d="M13 7V5.4A2.4 2.4 0 0 0 10.6 3H5.4A2.4 2.4 0 0 0 3 5.4v5.2A2.4 2.4 0 0 0 5.4 13H7"/></svg>',
+    check:
+      '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 10.5l3.5 3.5 7.5-8"/></svg>',
+    warn:
+      '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.4v4.3M10 13.4v.1"/></svg>',
+  };
+
+  const SPINNER = '<span class="spin"></span>';
+
+  const TEMPLATE = `
+  <div class="r" data-ref="r">
+    <div class="hl" data-ref="hl"></div>
+    <div class="tag" data-ref="tag"><span data-ref="tagName"></span><span class="d" data-ref="tagSize"></span></div>
+    <div class="rg" data-ref="rg"><span class="rg-size" data-ref="rgSize"></span></div>
+    <div class="spot" data-ref="spot"></div>
+
+    <div class="hud glass" data-ref="hud">
+      <span class="i"><kbd>Click</kbd> element</span>
+      <span class="i"><kbd>Drag</kbd> area</span>
+      <span class="i opt"><kbd>Space</kbd> screen</span>
+      <span class="i opt"><kbd>↑</kbd><kbd>↓</kbd> parent / child</span>
+      <button class="x" data-act="stop" title="Cancel (esc)">${ICON.close}</button>
+    </div>
+
+    <div class="cmp glass" data-ref="cmp" role="dialog" aria-label="Note">
+      <div class="cmp-head">
+        <span class="num" data-ref="cmpNum">1</span>
+        <span class="cmp-what" data-ref="cmpWhat"></span>
+      </div>
+      <img class="cmp-thumb" data-ref="cmpThumb" alt="" hidden>
+      <textarea data-ref="input" rows="1" spellcheck="true" placeholder="What should change?"></textarea>
+      <div class="cmp-foot">
+        <span class="cmp-hint"><span class="calm">esc to cancel</span><span class="warn">esc again to discard</span></span>
+        <button class="btn danger" data-act="delete" data-ref="cmpDelete" hidden>Delete</button>
+        <button class="btn ghost" data-act="next" data-ref="cmpNext" title="Save and capture the next one"><span>Next</span><kbd>${isMac ? '⌘' : 'Ctrl'}↵</kbd></button>
+        <button class="btn primary" data-act="save" data-ref="cmpSave"><kbd>↵</kbd><span>Save</span></button>
+      </div>
+    </div>
+
+    <div class="dock glass" data-ref="dock">
+      <button class="dock-notes" data-act="review" title="Review notes">
+        <span class="num" data-ref="dockCount">0</span><span data-ref="dockLabel">notes</span>
+      </button>
+      <button class="icon-btn" data-act="capture" data-ref="dockCapture" title="Capture">${ICON.capture}</button>
+      <button class="btn primary pill" data-act="copy" title="Save screenshots and copy everything for Claude">
+        <span class="ic">${ICON.copy}</span><span class="ic ok">${ICON.check}</span>${SPINNER}<span class="lbl">Copy for Claude</span>
+      </button>
+    </div>
+
+    <aside class="sheet glass" data-ref="sheet" aria-label="Redline notes">
+      <header class="sh-head">
+        <div class="sh-titles"><h2>Notes</h2><p data-ref="sheetSub"></p></div>
+        <button class="icon-btn" data-act="capture" title="Capture">${ICON.capture}</button>
+        <button class="icon-btn" data-act="close" title="Close (esc)">${ICON.close}</button>
+      </header>
+      <div class="sh-list" data-ref="list"></div>
+      <div class="sh-empty" data-ref="empty" hidden>
+        <div class="empty-ic">${ICON.capture}</div>
+        <p>Press <kbd data-shortcut></kbd> on any page,<br>click what needs work, and say what should change.</p>
+        <button class="link" data-act="shortcuts">Change shortcut</button>
+      </div>
+      <footer class="sh-foot">
+        <button class="btn ghost" data-act="clear">New session</button>
+        <button class="btn primary" data-act="copy">
+          <span class="ic">${ICON.copy}</span><span class="ic ok">${ICON.check}</span>${SPINNER}<span class="lbl">Copy for Claude</span>
+        </button>
+      </footer>
+      <p class="sh-note">Screenshots are saved to Downloads/Redline and linked in the text.</p>
+    </aside>
+
+    <div class="lb" data-ref="lb" data-act="unzoom" hidden><img data-ref="lbImg" alt=""></div>
+
+    <div class="toast glass" data-ref="toast" role="status">
+      <span class="t-ic" data-ref="toastIcon" hidden></span>
+      <span data-ref="toastText"></span>
+      <button data-act="toast" data-ref="toastBtn" hidden></button>
+    </div>
+  </div>`;
+
+  const FONT = '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", "Segoe UI", system-ui, sans-serif';
+  const MONO = 'ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace';
+
+  const STYLES = `
+  :host { all: initial; }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  [hidden] { display: none !important; }
+  button { font: inherit; color: inherit; background: none; border: 0; cursor: pointer; -webkit-tap-highlight-color: transparent; }
+  button:disabled { opacity: .4; pointer-events: none; }
+  button:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+  svg { width: 16px; height: 16px; display: block; flex: none; }
+
+  .r {
+    --blue: #007aff; --red: #ff3b30; --green: #28cd41;
+    --text: rgba(0,0,0,.86); --text2: rgba(60,60,67,.64); --text3: rgba(60,60,67,.34);
+    --glass: rgba(246,246,248,.74); --solid: rgba(252,252,253,.92); --card: rgba(255,255,255,.9);
+    --line: rgba(0,0,0,.09); --fill: rgba(118,118,128,.12); --fill2: rgba(118,118,128,.2);
+    --shadow: 0 0 0 .5px rgba(0,0,0,.14), 0 1px 2px rgba(0,0,0,.06), 0 12px 40px -8px rgba(0,0,0,.24);
+    --ease: cubic-bezier(.32,.72,0,1);
+    --spring: cubic-bezier(.34,1.4,.64,1);
+    position: fixed; inset: 0; pointer-events: none;
+    font: 13px/1.38 ${FONT}; color: var(--text);
+    -webkit-font-smoothing: antialiased; letter-spacing: -.004em;
+  }
+  @media (prefers-color-scheme: dark) {
+    .r {
+      --blue: #0a84ff; --red: #ff453a; --green: #32d74b;
+      --text: rgba(255,255,255,.92); --text2: rgba(235,235,245,.62); --text3: rgba(235,235,245,.32);
+      --glass: rgba(40,40,44,.8); --solid: rgba(38,38,42,.94); --card: rgba(255,255,255,.06);
+      --line: rgba(255,255,255,.1); --fill: rgba(118,118,128,.24); --fill2: rgba(118,118,128,.36);
+      --shadow: 0 0 0 .5px rgba(255,255,255,.14), 0 0 0 1px rgba(0,0,0,.45), 0 16px 48px -8px rgba(0,0,0,.65);
+    }
+  }
+  .glass { background: var(--glass); -webkit-backdrop-filter: blur(28px) saturate(1.8); backdrop-filter: blur(28px) saturate(1.8); box-shadow: var(--shadow); }
+
+  kbd {
+    display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; padding: 0 5px;
+    border-radius: 5px; background: var(--fill); color: var(--text); box-shadow: inset 0 -.5px 0 var(--line);
+    font: 500 11px/1 ${FONT}; letter-spacing: 0;
+  }
+  .num {
+    flex: none; display: inline-grid; place-items: center; min-width: 20px; height: 20px; padding: 0 6px; border-radius: 10px;
+    background: var(--red); color: #fff; font: 600 11.5px/1 ${FONT}; font-variant-numeric: tabular-nums; letter-spacing: 0;
+  }
+  .mono { font-family: ${MONO}; font-size: 11.5px; }
+
+  /* Buttons */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 28px; padding: 0 10px; border-radius: 8px;
+    font-size: 12.5px; font-weight: 500; white-space: nowrap; transition: transform .15s var(--ease), background-color .15s, filter .15s;
+  }
+  .btn:active { transform: scale(.96); }
+  .btn.primary { background: var(--blue); color: #fff; }
+  .btn.primary:hover { filter: brightness(1.08); }
+  .btn.primary kbd { background: rgba(255,255,255,.2); color: #fff; box-shadow: none; min-width: 0; height: 17px; padding: 0 4px; font-size: 11px; }
+  .btn.ghost { background: var(--fill); }
+  .btn.ghost:hover { background: var(--fill2); }
+  .btn.ghost kbd { background: transparent; box-shadow: none; color: var(--text2); min-width: 0; height: 17px; padding: 0; }
+  .btn.danger { color: var(--red); margin-right: auto; padding: 0 6px; }
+  .btn.danger:hover { background: color-mix(in srgb, var(--red) 12%, transparent); }
+  .btn .ic.ok, .btn .spin { display: none; }
+  .btn.busy .spin { display: block; }
+  .btn.busy .ic { display: none; }
+  .btn.done .ic { display: none; }
+  .btn.done .ic.ok { display: block; }
+  .btn.done { background: var(--green); }
+  .spin { width: 14px; height: 14px; border-radius: 50%; border: 2px solid rgba(255,255,255,.35); border-top-color: #fff; animation: spin .7s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .icon-btn { width: 32px; height: 32px; border-radius: 16px; display: grid; place-items: center; color: var(--text2); transition: background-color .15s, color .15s; }
+  .icon-btn:hover { background: var(--fill); color: var(--text); }
+  .icon-btn svg { width: 18px; height: 18px; }
+  .link { color: var(--blue); font-size: 12.5px; }
+  .link:hover { text-decoration: underline; }
+
+  /* Picker */
+  .hl {
+    position: fixed; left: 0; top: 0; pointer-events: none; opacity: 0;
+    background: color-mix(in srgb, var(--blue) 9%, transparent); box-shadow: 0 0 0 1.5px var(--blue);
+    transition: transform .09s var(--ease), width .09s var(--ease), height .09s var(--ease), border-radius .09s, opacity .12s;
+    will-change: transform, width, height;
+  }
+  .hl.on, .tag.on, .rg.on { opacity: 1; }
+  .tag {
+    position: fixed; left: 0; top: 0; pointer-events: none; opacity: 0; display: flex; align-items: center; gap: 7px; height: 22px; padding: 0 8px;
+    border-radius: 6px; background: rgba(28,28,30,.92); color: #fff; font: 500 11px/1 ${MONO}; white-space: nowrap;
+    box-shadow: 0 2px 10px rgba(0,0,0,.18); transition: opacity .12s;
+  }
+  .tag .d { color: rgba(255,255,255,.5); }
+  .rg {
+    position: fixed; left: 0; top: 0; pointer-events: none; opacity: 0;
+    background: color-mix(in srgb, var(--blue) 6%, transparent);
+    box-shadow: 0 0 0 1.5px var(--blue), 0 0 0 100vmax rgba(0,0,0,.24);
+  }
+  .rg-size {
+    position: absolute; right: 0; top: calc(100% + 6px); height: 22px; padding: 0 8px; border-radius: 6px; display: flex; align-items: center;
+    background: rgba(28,28,30,.92); color: #fff; font: 500 11px/1 ${MONO}; white-space: nowrap;
+  }
+  .rg.inside .rg-size { top: auto; bottom: 6px; right: 6px; }
+  .flash { position: fixed; pointer-events: none; background: #fff; border-radius: 4px; animation: flash .5s var(--ease) forwards; }
+  @keyframes flash { from { opacity: .9; } to { opacity: 0; } }
+
+  .hud {
+    position: fixed; left: 50%; bottom: 24px; display: flex; align-items: center; gap: 16px; height: 44px; padding: 0 6px 0 18px;
+    border-radius: 22px; color: var(--text2); font-size: 12.5px; white-space: nowrap; pointer-events: none;
+    opacity: 0; transform: translate(-50%, 14px) scale(.97); transition: opacity .2s, transform .4s var(--ease);
+  }
+  .hud.on { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+  .hud.top { bottom: auto; top: 24px; }
+  .hud.on.dragging { opacity: 0; pointer-events: none; }
+  .hud .i { display: flex; align-items: center; gap: 6px; }
+  .hud .i kbd + kbd { margin-left: -3px; }
+  .hud .x { width: 32px; height: 32px; border-radius: 16px; display: grid; place-items: center; color: var(--text2); margin-left: -4px; }
+  .hud .x:hover { background: var(--fill); color: var(--text); }
+  @media (max-width: 640px) { .hud .opt { display: none; } }
+
+  /* Composer */
+  .spot {
+    position: fixed; pointer-events: none; opacity: 0; border-radius: 6px;
+    box-shadow: 0 0 0 2px var(--blue), 0 0 0 100vmax rgba(0,0,0,.32); transition: opacity .25s var(--ease);
+  }
+  .spot.screen { box-shadow: inset 0 0 0 3px var(--blue); border-radius: 0; }
+  .spot.on { opacity: 1; }
+  .cmp {
+    position: fixed; left: 0; top: 0; width: 336px; max-width: calc(100vw - 24px); border-radius: 14px; overflow: hidden;
+    display: flex; flex-direction: column; background: var(--solid);
+    pointer-events: none; opacity: 0; transform: scale(.94); transition: opacity .16s, transform .32s var(--spring);
+  }
+  .cmp.on { opacity: 1; transform: none; pointer-events: auto; }
+  .cmp-head { display: flex; align-items: center; gap: 8px; padding: 12px 14px 0; min-width: 0; }
+  .cmp-what { font: 500 11.5px/1.2 ${MONO}; color: var(--text2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  .cmp-thumb { display: block; margin: 10px 14px 0; width: calc(100% - 28px); max-height: 150px; object-fit: contain; border-radius: 8px; background: var(--fill); }
+  .cmp textarea {
+    display: block; width: 100%; min-height: 54px; max-height: 260px; field-sizing: content; resize: none; border: 0; outline: 0;
+    background: transparent; color: var(--text); caret-color: var(--blue); padding: 8px 14px 12px;
+    font: 400 15px/1.42 ${FONT}; letter-spacing: -.01em;
+  }
+  .cmp textarea::placeholder { color: var(--text3); }
+  .cmp-foot { display: flex; align-items: center; gap: 6px; padding: 8px 8px 8px 14px; border-top: .5px solid var(--line); }
+  .cmp-hint { margin-right: auto; font-size: 11.5px; color: var(--text3); white-space: nowrap; }
+  .cmp-hint .warn { display: none; color: var(--red); }
+  .cmp.edit:not(.armed) .cmp-hint { display: none; }
+  .cmp.edit.armed .btn.danger { display: none; }
+  .cmp.armed .cmp-hint .calm { display: none; }
+  .cmp.armed .cmp-hint .warn { display: inline; }
+  .cmp .btn.danger + .btn, .cmp .btn.danger ~ .btn { margin-left: 0; }
+  .cmp.shake { animation: shake .42s; }
+  @keyframes shake { 15%, 85% { translate: -2px 0; } 30%, 70% { translate: 4px 0; } 45% { translate: -5px 0; } 60% { translate: 5px 0; } }
+
+  /* Dock */
+  .dock {
+    position: fixed; right: 20px; bottom: 20px; display: flex; align-items: center; gap: 2px; height: 44px; padding: 6px; border-radius: 22px;
+    pointer-events: none; opacity: 0; transform: translateY(14px) scale(.96); transition: opacity .2s, transform .45s var(--ease);
+  }
+  .dock.on { opacity: 1; transform: none; pointer-events: auto; }
+  .dock-notes { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 12px 0 6px; border-radius: 16px; font-weight: 500; transition: background-color .15s; }
+  .dock-notes:hover { background: var(--fill); }
+  .btn.pill { height: 32px; border-radius: 16px; padding: 0 14px 0 11px; margin-left: 2px; font-size: 13px; }
+  .bump { animation: bump .5s var(--spring); }
+  @keyframes bump { 35% { transform: scale(1.3); } }
+
+  /* Sheet */
+  .sheet {
+    position: fixed; top: 12px; right: 12px; bottom: 12px; width: 384px; max-width: calc(100vw - 24px); border-radius: 18px;
+    display: flex; flex-direction: column; overflow: hidden; background: var(--solid);
+    pointer-events: none; transform: translateX(calc(100% + 32px)); transition: transform .5s var(--ease);
+  }
+  .sheet.on { transform: none; pointer-events: auto; }
+  .sh-head { display: flex; align-items: center; gap: 2px; padding: 16px 12px 10px 20px; }
+  .sh-titles { margin-right: auto; min-width: 0; }
+  .sh-titles h2 { font-size: 19px; font-weight: 700; letter-spacing: -.024em; line-height: 1.2; }
+  .sh-titles p { font-size: 12px; color: var(--text2); margin-top: 1px; }
+  .sh-list { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 4px 12px 14px; display: flex; flex-direction: column; gap: 10px; scrollbar-width: thin; }
+  .card { border-radius: 14px; padding: 8px; background: var(--card); box-shadow: 0 0 0 .5px var(--line), 0 1px 2px rgba(0,0,0,.04); animation: rise .35s var(--ease) both; }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
+  .card-shot { position: relative; border-radius: 9px; overflow: hidden; background: var(--fill); cursor: zoom-in; min-height: 60px; }
+  .card-shot img { display: block; width: 100%; max-height: 210px; object-fit: contain; }
+  .card-shot img:not([src]) { visibility: hidden; height: 120px; }
+  .card-shot .num { position: absolute; left: 8px; top: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.25); }
+  .card-del {
+    position: absolute; right: 6px; top: 6px; width: 28px; height: 28px; border-radius: 14px; display: grid; place-items: center;
+    color: #fff; background: rgba(0,0,0,.5); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+    opacity: 0; transition: opacity .15s, background-color .15s;
+  }
+  .card:hover .card-del, .card-del:focus-visible { opacity: 1; }
+  .card-del:hover { background: var(--red); }
+  .card-note {
+    display: block; width: 100%; min-height: 30px; max-height: 240px; field-sizing: content; resize: none; border: 0; outline: 0;
+    background: transparent; color: var(--text); caret-color: var(--blue); padding: 9px 6px 4px; border-radius: 6px;
+    font: 400 14px/1.42 ${FONT}; letter-spacing: -.008em;
+  }
+  .card-note::placeholder { color: var(--text3); }
+  .card-meta { display: flex; align-items: center; gap: 8px; padding: 2px 6px 3px; color: var(--text2); font-size: 11.5px; min-width: 0; }
+  .card-meta .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1 1 auto; }
+  .card-meta a { flex: none; max-width: 48%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text2); text-decoration: none; }
+  .card-meta a:hover { color: var(--blue); }
+  .sh-empty { flex: 1; display: grid; place-content: center; justify-items: center; gap: 14px; padding: 32px; text-align: center; color: var(--text2); line-height: 1.5; }
+  .empty-ic { width: 56px; height: 56px; border-radius: 16px; display: grid; place-items: center; background: var(--fill); color: var(--text2); }
+  .empty-ic svg { width: 26px; height: 26px; }
+  .sh-foot { display: flex; gap: 8px; padding: 12px 12px 6px; border-top: .5px solid var(--line); }
+  .sh-foot .btn { height: 38px; border-radius: 11px; font-size: 13.5px; padding: 0 14px; }
+  .sh-foot .primary { flex: 1; }
+  .sh-note { padding: 2px 12px 12px; text-align: center; font-size: 11px; color: var(--text3); }
+
+  .lb {
+    position: fixed; inset: 0; display: grid; place-items: center; padding: 4vh 4vw; background: rgba(0,0,0,.55);
+    -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); cursor: zoom-out; pointer-events: auto; opacity: 0; transition: opacity .2s;
+  }
+  .lb.on { opacity: 1; }
+  .lb img { max-width: 100%; max-height: 92vh; border-radius: 10px; box-shadow: 0 24px 80px rgba(0,0,0,.5); transform: scale(.97); transition: transform .3s var(--ease); }
+  .lb.on img { transform: none; }
+
+  /* Toast */
+  .toast {
+    position: fixed; left: 50%; bottom: 24px; display: flex; align-items: center; gap: 10px; height: 44px; padding: 0 18px; border-radius: 22px;
+    font-weight: 500; white-space: nowrap; max-width: calc(100vw - 24px);
+    pointer-events: none; opacity: 0; transform: translate(-50%, 16px) scale(.97); transition: opacity .2s, transform .45s var(--ease);
+  }
+  .toast.on { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
+  .toast:has(button:not([hidden])) { padding-right: 6px; }
+  .t-ic { color: var(--green); margin-left: -4px; }
+  .t-ic svg { width: 18px; height: 18px; }
+  .toast.error .t-ic { color: var(--red); }
+  .toast button { height: 32px; padding: 0 12px; border-radius: 16px; color: var(--blue); font-weight: 600; transition: background-color .15s; }
+  .toast button:hover { background: var(--fill); }
+
+  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition-duration: 0s !important; animation-duration: 0s !important; } }
+  `;
+
+  const PIN_CSS = `
+  :host { all: initial; }
+  .layer { position: absolute; left: 0; top: 0; width: 0; height: 0; }
+  [hidden] { display: none !important; }
+  .p {
+    position: absolute; width: 22px; height: 22px; margin: -11px 0 0 -11px; padding: 0; border: 0; border-radius: 11px;
+    display: grid; place-items: center; cursor: pointer; pointer-events: auto;
+    background: #ff3b30; color: #fff; font: 600 11.5px/1 ${FONT}; font-variant-numeric: tabular-nums; -webkit-font-smoothing: antialiased;
+    box-shadow: 0 0 0 2px #fff, 0 2px 8px rgba(0,0,0,.28);
+    transition: transform .25s cubic-bezier(.34,1.4,.64,1); animation: pop .45s cubic-bezier(.34,1.4,.64,1) both;
+  }
+  .p.fixed { position: fixed; }
+  .p:hover { transform: scale(1.14); }
+  .layer.picking .p { pointer-events: none; opacity: .55; }
+  .p.pulse { animation: pulse 1.1s ease-out; }
+  @keyframes pop { from { transform: scale(0); } }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 2px #fff, 0 0 0 2px rgba(255,59,48,.6); } 100% { box-shadow: 0 0 0 2px #fff, 0 0 0 22px rgba(255,59,48,0); } }
+  .tip {
+    position: absolute; left: 30px; top: -4px; width: max-content; max-width: 280px; padding: 8px 11px; border-radius: 10px;
+    background: rgba(28,28,30,.94); color: #fff; font: 400 12.5px/1.4 ${FONT}; text-align: left; white-space: pre-wrap;
+    box-shadow: 0 8px 28px rgba(0,0,0,.25); pointer-events: none; opacity: 0; transform: translateX(-4px); transition: opacity .15s, transform .2s;
+    display: -webkit-box; -webkit-line-clamp: 6; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .layer.busy .tip { display: none; }
+  .p.flip .tip { left: auto; right: 30px; transform: translateX(4px); }
+  .p:hover .tip { opacity: 1; transform: none; }
+  .tip:empty { display: none; }
+  `;
+})();

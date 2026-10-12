@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Redline</title>
+  <link rel="icon" href="icons/32.png">
+  <style>
+    :root {
+      --bg: #f5f5f7; --surface: #fff; --text: #1d1d1f; --text2: #6e6e73; --text3: #86868b;
+      --line: rgba(0,0,0,.08); --fill: rgba(118,118,128,.12); --blue: #0071e3; --red: #ff3b30;
+      color-scheme: light dark;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg: #000; --surface: #161618; --text: #f5f5f7; --text2: #a1a1a6; --text3: #6e6e73; --line: rgba(255,255,255,.1); --fill: rgba(118,118,128,.24); --blue: #2997ff; --red: #ff453a; }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg); color: var(--text);
+      font: 17px/1.47 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", system-ui, sans-serif;
+      letter-spacing: -.022em; -webkit-font-smoothing: antialiased;
+    }
+    main { max-width: 980px; margin: 0 auto; padding: 88px 24px 72px; }
+    .hero { text-align: center; }
+    .hero img { width: 96px; height: 96px; filter: drop-shadow(0 10px 24px rgba(0,0,0,.18)); }
+    h1 { margin-top: 22px; font-size: clamp(40px, 6vw, 64px); line-height: 1.06; font-weight: 700; letter-spacing: -.035em; }
+    h1, .lede, .step p, .try p { text-wrap: balance; }
+    .lede { max-width: 620px; margin: 16px auto 0; font-size: 21px; line-height: 1.4; color: var(--text2); letter-spacing: -.016em; }
+    .shortcut { display: inline-flex; align-items: center; gap: 14px; margin-top: 36px; padding: 12px 14px 12px 20px; border-radius: 18px; background: var(--surface); box-shadow: 0 0 0 .5px var(--line), 0 8px 30px -12px rgba(0,0,0,.16); font-size: 15px; color: var(--text2); }
+    .keys { display: inline-flex; gap: 5px; }
+    .keys kbd, kbd {
+      display: inline-grid; place-items: center; min-width: 34px; height: 34px; padding: 0 9px; border-radius: 8px;
+      background: var(--bg); color: var(--text); font: 500 16px/1 inherit; box-shadow: inset 0 -1px 0 var(--line), 0 0 0 .5px var(--line);
+    }
+    kbd.sm { min-width: 22px; height: 22px; padding: 0 6px; border-radius: 6px; font-size: 13px; vertical-align: 1px; }
+    button.link { border: 0; background: none; font: inherit; color: var(--blue); cursor: pointer; padding: 6px 8px; border-radius: 8px; }
+    button.link:hover { text-decoration: underline; }
+    .missing { color: var(--red); }
+
+    .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 72px; }
+    .step { padding: 28px 26px 30px; border-radius: 22px; background: var(--surface); box-shadow: 0 0 0 .5px var(--line); }
+    .step .n { display: inline-grid; place-items: center; width: 26px; height: 26px; border-radius: 13px; background: var(--red); color: #fff; font-size: 13px; font-weight: 600; letter-spacing: 0; }
+    .step h2 { margin-top: 16px; font-size: 21px; line-height: 1.2; letter-spacing: -.02em; }
+    .step p { margin-top: 8px; font-size: 15px; line-height: 1.5; color: var(--text2); letter-spacing: -.01em; }
+
+    .try { margin-top: 16px; padding: 40px; border-radius: 22px; background: var(--surface); box-shadow: 0 0 0 .5px var(--line); display: grid; grid-template-columns: 1fr 320px; gap: 40px; align-items: center; }
+    .try h2 { font-size: 28px; letter-spacing: -.028em; line-height: 1.15; }
+    .try p { margin-top: 10px; color: var(--text2); font-size: 16px; }
+    .demo { border-radius: 18px; overflow: hidden; background: var(--bg); box-shadow: 0 0 0 .5px var(--line); }
+    .demo .art { height: 168px; background: radial-gradient(120% 90% at 20% 10%, #ffd6a5 0, transparent 60%), radial-gradient(100% 90% at 90% 30%, #ff8fa3 0, transparent 55%), linear-gradient(135deg, #a0c4ff, #bdb2ff); }
+    .demo .body { padding: 18px 20px 20px; }
+    .demo .eyebrow { font-size: 12px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--red); }
+    .demo h3 { margin-top: 4px; font-size: 19px; letter-spacing: -.02em; }
+    .demo .price { margin-top: 2px; color: var(--text2); font-size: 15px; }
+    .demo .cta { margin-top: 14px; width: 100%; height: 42px; border: 0; border-radius: 12px; background: var(--text); color: var(--bg); font: 600 15px/1 inherit; cursor: pointer; }
+
+    .fine { margin-top: 40px; text-align: center; font-size: 13px; color: var(--text3); letter-spacing: -.005em; }
+    @media (max-width: 820px) {
+      main { padding-top: 56px; }
+      .steps, .try { grid-template-columns: 1fr; }
+      .try { padding: 28px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="hero">
+      <img src="icons/128.png" alt="">
+      <h1>Point at it. Say it.<br>Paste into Claude.</h1>
+      <p class="lede">Redline turns a QA pass into one clean prompt. Every screenshot is paired with your note, so Claude knows exactly which change goes where.</p>
+      <div class="shortcut">
+        <span id="shortcut-label">Capture anywhere with</span>
+        <span class="keys" id="keys"></span>
+        <button class="link" id="change">Change</button>
+      </div>
+    </section>
+
+    <section class="steps">
+      <article class="step">
+        <span class="n">1</span>
+        <h2>Capture</h2>
+        <p>Press the shortcut or click the toolbar icon. Click an element, drag an area, or press <kbd class="sm">Space</kbd> for the whole screen. <kbd class="sm">↑</kbd> selects the parent.</p>
+      </article>
+      <article class="step">
+        <span class="n">2</span>
+        <h2>Say what changes</h2>
+        <p>A note field opens right beside it. <kbd class="sm">↵</kbd> saves, <kbd class="sm">⌘↵</kbd> saves and goes straight to the next capture. Red pins mark what you’ve covered.</p>
+      </article>
+      <article class="step">
+        <span class="n">3</span>
+        <h2>Copy for Claude</h2>
+        <p>One click saves the screenshots to Downloads/Redline and copies a prompt that links each one to its note. Paste it into Claude Code.</p>
+      </article>
+    </section>
+
+    <section class="try">
+      <div>
+        <h2>Try it here.</h2>
+        <p>Press <span id="inline-keys">the shortcut</span>, click the button on the card, and type what you’d change. Then open the dock in the corner and hit <b>Copy for Claude</b>.</p>
+      </div>
+      <div class="demo">
+        <div class="art"></div>
+        <div class="body">
+          <div class="eyebrow">New</div>
+          <h3>Autumn Craft Box</h3>
+          <div class="price">$34.99 / month</div>
+          <button class="cta" type="button">Add to cart</button>
+        </div>
+      </div>
+    </section>
+
+    <p class="fine">Pin Redline from the puzzle-piece menu so it’s one click away. Right-click its icon to review, copy or start a new session. Everything stays on this computer.</p>
+  </main>
+
+  <script src="welcome.js"></script>
+  <script src="src/content.js"></script>
+</body>
+</html>
