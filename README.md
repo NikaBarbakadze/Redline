@@ -111,7 +111,7 @@ To paste just the text, use **Paste and Match Style** (<kbd>⌥</kbd><kbd>⇧</k
 
 ## Privacy and permissions
 
-Redline has no backend and makes no network requests. Notes and screenshots stay in the extension's local storage, and the only files it writes are the screenshots it saves to your Downloads folder when you copy.
+Redline has no backend and makes no network requests ([privacy policy](PRIVACY.md)). Notes and screenshots stay in the extension's local storage, and the only files it writes are the screenshots it saves to your Downloads folder when you copy.
 
 | Permission | Why |
 |---|---|
@@ -153,6 +153,10 @@ node pages.mjs                           # or a single suite
 ```
 
 `npm run icons` (from `tests/`) re-renders the icons from `tools/make-icons.mjs`.
+
+### Releasing
+
+`./tools/package.sh` builds `redline-<version>.zip` for the Chrome Web Store with only the files the extension loads. `REDLINE_EXT=<unzipped folder> npm test` runs the suites against that build. `store/LISTING.md` has the listing text and the privacy answers, and `node tools/store-shots.mjs` re-renders the store screenshots.
 
 ## Contributing
 

@@ -3,7 +3,7 @@
   "name": "Redline",
   "short_name": "Redline",
   "version": "1.5.1",
-  "description": "Point at anything on a page, say what should change, paste the whole session into Claude.",
+  "description": "Point at anything on a web page, say what should change, and hand the whole batch to your coding agent.",
   "minimum_chrome_version": "123",
   "icons": {
     "16": "icons/16.png",

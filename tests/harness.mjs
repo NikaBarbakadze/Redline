@@ -8,7 +8,8 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-export const EXT = path.resolve(HERE, '..');
+// REDLINE_EXT points the suites at another build, e.g. the unzipped store package.
+export const EXT = process.env.REDLINE_EXT ? path.resolve(process.env.REDLINE_EXT) : path.resolve(HERE, '..');
 export const SHOTS = path.join(HERE, '.shots');
 fs.mkdirSync(SHOTS, { recursive: true });
 
