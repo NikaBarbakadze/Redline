@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Redline",
   "short_name": "Redline",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Point at anything on a page, say what should change, paste the whole session into Claude.",
   "minimum_chrome_version": "123",
   "icons": {
@@ -30,7 +30,7 @@
       "js": [
         "src/content.js"
       ],
-      "run_at": "document_idle",
+      "run_at": "document_start",
       "all_frames": true,
       "match_origin_as_fallback": true
     }

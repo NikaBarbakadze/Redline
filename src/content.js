@@ -249,17 +249,6 @@
     });
   }
 
-  // Esc on anything inside Redline that didn't handle it itself (the composer
-  // and note fields do) gets the usual "close what's open, else hide".
-  function keepEscape(scope) {
-    scope.addEventListener('keydown', (e) => {
-      if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
-      e.preventDefault();
-      if (IS_TOP) escape();
-      else toParent({ type: 'esc' });
-    });
-  }
-
   // Keep keystrokes typed into Redline away from the page's own shortcuts.
   function isolate(rootNode) {
     const events = ['keydown', 'keyup', 'keypress', 'input', 'paste', 'copy', 'cut', 'focusin', 'focusout', 'wheel'];
@@ -276,19 +265,8 @@
       if (act) actions[act]?.(e);
       dropButtonFocus(e, root);
     });
-    keepEscape(root);
 
-    // Composer
-    $.input.addEventListener('keydown', (e) => {
-      if (e.isComposing) return;
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        commit({ next: e.metaKey || e.ctrlKey });
-      } else if (e.key === 'Escape') {
-        e.preventDefault();
-        dismissComposer();
-      }
-    });
+    // Composer (Enter/Esc are handled by the key router, see onKeyDown)
     $.input.addEventListener('input', () => {
       composer && (composer.armed = false);
       $.cmp.classList.remove('armed');
@@ -306,9 +284,6 @@
     $.list.addEventListener('focusout', (e) => {
       const ta = e.target.closest?.('.card-note');
       if (ta?._save) clearTimeout(ta._save), saveNote(ta.closest('.card').dataset.id, ta.value);
-    });
-    $.list.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') e.target.blur?.();
     });
   }
 
@@ -384,7 +359,6 @@
     for (const type of ['mousedown', 'mouseup', 'click', 'dblclick', 'auxclick', 'contextmenu', 'dragstart', 'selectstart', 'touchstart']) {
       addEventListener(type, swallow, opts);
     }
-    addEventListener('keydown', onPickKey, opts);
     addEventListener('pointerout', (e) => !e.relatedTarget && clearHover(), opts); // left this frame
     addEventListener('scroll', () => pick.el && !pick.drag && drawHighlight(pick.el), { capture: true, passive: true, signal: pickAbort.signal });
 
@@ -515,13 +489,6 @@
       return;
     }
     if (pick.el) submit(elementPayload(pick.el));
-  }
-
-  function onPickKey(e) {
-    if (ours(e)) return;
-    if (!pickKey(e.key)) return;
-    e.preventDefault();
-    e.stopImmediatePropagation();
   }
 
   const NAV_KEYS = ['Enter', 'ArrowUp', 'ArrowDown'];
@@ -1110,17 +1077,84 @@
     render();
     refreshHistory();
     requestAnimationFrame(() => $.sheet.classList.add('on'));
-    on(window, 'keydown', onSheetKey, { capture: true });
   }
 
-  // Esc that nothing else claimed (no picker, composer or panel open; not typed
-  // into a field; not handled by the page). Child frames pass it to the top.
-  function onIdleEscape(e) {
-    if (e.key !== 'Escape' || e.defaultPrevented || e.repeat || e.isComposing) return;
+  // -------------------------------------------------------------------------
+  // Keys. This script runs at document_start, so these capture listeners are
+  // registered before any of the page's own: sites (and other extensions) that
+  // grab Esc can't starve Redline of it. If something registered even earlier
+  // swallows the keydown, the keyup is handled instead.
+
+  let escDown = false; // saw this Esc's keydown
+  let escIdle = false; // …and it's waiting for the bubble-phase idle handler
+
+  function onKeyDown(e) {
+    if (e.key === 'Escape') escDown = true;
+    routeKey(e, false);
+  }
+
+  function onKeyUp(e) {
+    if (e.key !== 'Escape') return;
+    const missed = !escDown;
+    const idle = escIdle;
+    escDown = escIdle = false;
+    if (missed) routeKey(e, true);
+    else if (idle) idleEscape(e); // the page stopped it before our bubble listener
+  }
+
+  function claim(e) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }
+
+  function routeKey(e, late) {
+    if (e.isComposing) return;
+    if (mode === 'picking') {
+      // From inside Redline (a focused button) only Esc counts; Enter still clicks it.
+      const key = e.key === 'Escape' ? 'Escape' : late || ours(e) ? null : e.key;
+      if (key && pickKey(key)) claim(e);
+      return;
+    }
+    if (ours(e)) return ownKey(e, late);
+    if (e.key !== 'Escape') return;
+    if (IS_TOP && (lightboxOpen || sheetOpen || mode === 'composing')) return claim(e), escape();
+    if (!IS_TOP && topComposing) return claim(e), toParent({ type: 'esc' }); // composer open up top
+    if (late) idleEscape(e);
+    else escIdle = !pageOverlayOpen(); // decided now: by keyup the page's dialog is gone
+  }
+
+  // The page has its own dialog/popover/modal open, so this Esc is for it.
+  function pageOverlayOpen() {
+    return !!document.querySelector('dialog[open], [aria-modal="true"], :popover-open:not(redline-ui)');
+  }
+
+  // Keys typed into Redline (composer, note fields, buttons, pins) never reach
+  // the page; their default action (typing, button activation) still happens.
+  function ownKey(e, late) {
+    if (!late) e.stopImmediatePropagation();
+    const target = e.composedPath()[0];
+    if (!late && target === $.input && e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      return commit({ next: e.metaKey || e.ctrlKey });
+    }
+    if (e.key !== 'Escape') return;
+    e.preventDefault();
+    if (target === $.input) dismissComposer();
+    else if (IS_TOP) escape();
+    else toParent({ type: 'esc' });
+  }
+
+  // Esc with nothing of Redline's open: tucks the session away. Runs after the
+  // page's own handlers (bubble phase), and not while typing in a field.
+  function idleEscape(e) {
+    if (e.key !== 'Escape') return;
+    const wanted = e.type === 'keyup' ? true : !pageOverlayOpen();
+    escIdle = false;
+    if (!wanted || e.repeat || e.isComposing || mode !== 'idle') return;
     const t = e.composedPath()[0];
     if (t?.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t?.tagName)) return;
-    if (!IS_TOP) return mode === 'idle' && toParent({ type: 'esc' });
-    escape();
+    if (IS_TOP) escape();
+    else toParent({ type: 'esc' });
   }
 
   function escape() {
@@ -1140,18 +1174,9 @@
     toast('Notes hidden. They come back on your next capture.', { action: 'Show', onAction: () => setUiHidden(false) });
   }
 
-  function onSheetKey(e) {
-    if (!sheetOpen) return;
-    if (e.key !== 'Escape') return;
-    e.preventDefault();
-    e.stopImmediatePropagation();
-    escape();
-  }
-
   function closeSheet() {
     if (!sheetOpen) return;
     sheetOpen = false;
-    removeEventListener('keydown', onSheetKey, { capture: true });
     $.sheet.classList.remove('on');
     root.activeElement?.blur();
     render();
@@ -1499,7 +1524,6 @@
       if (item) closeSheet(), showItem(item);
       dropButtonFocus(e, shadow);
     });
-    keepEscape(shadow);
     document.documentElement.append(pinsHost);
   }
 
@@ -1577,14 +1601,6 @@
   const childAgents = new Set(); // <iframe>s whose document runs Redline
   let topComposing = false; // child frames: the top frame's composer is open
 
-  // Esc pressed in a child frame while the composer is open cancels it, even
-  // from one of the page's own fields, instead of reaching the page.
-  function onComposingKey(e) {
-    if (IS_TOP || !topComposing || e.key !== 'Escape') return;
-    e.preventDefault();
-    e.stopImmediatePropagation();
-    toParent({ type: 'esc' });
-  }
 
   const viewportBounds = () => ({ x: 0, y: 0, w: innerWidth, h: innerHeight });
   const shift = (r, o) => r && { ...r, x: r.x + o.x, y: r.y + o.y };
@@ -1759,13 +1775,13 @@
     } catch {}
   }
 
+  on(window, 'keydown', onKeyDown, { capture: true });
+  on(window, 'keyup', onKeyUp, { capture: true });
+  on(window, 'keydown', idleEscape);
   on(window, 'pointermove', (e) => ((pointer.x = e.clientX), (pointer.y = e.clientY)), { passive: true, capture: true });
   on(window, 'pointerout', (e) => !e.relatedTarget && (pointer.x = pointer.y = -1), { passive: true, capture: true });
   on(window, 'message', onFrameMessage);
-  on(window, 'keydown', onIdleEscape);
-  on(window, 'keydown', onComposingKey, { capture: true });
   if (!IS_TOP) toParent({ type: 'hello' });
-  pingChildren();
   on(window, 'resize', () => pinEls.size && renderPins(), { passive: true });
 
   // SPA navigation and late layout shifts move things around; re-check now and then.
@@ -1783,9 +1799,15 @@
   chrome.runtime.onMessage.addListener(onMessage);
   chrome.storage.onChanged.addListener(onStorage);
   chrome.tabs?.getCurrent?.((tab) => (myTabId = tab?.id ?? null));
-  chrome.storage.local.get([KEY, 'uiHidden']).then((stored) => {
+  // Injected at document_start for the key listeners; the first render waits
+  // for the page's DOM so nothing is added before the page builds its own.
+  const domReady = new Promise((resolve) =>
+    document.readyState === 'loading' ? on(document, 'DOMContentLoaded', resolve, { once: true }) : resolve(),
+  );
+  Promise.all([chrome.storage.local.get([KEY, 'uiHidden']), domReady]).then(([stored]) => {
     session = stored[KEY] ?? null;
     uiHidden = !!stored.uiHidden;
+    pingChildren();
     render();
   });
 
