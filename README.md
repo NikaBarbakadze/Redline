@@ -49,7 +49,7 @@ Redline isn't on the Chrome Web Store. Install it from a release:
 3. Click **Load unpacked** and select the unzipped folder.
 4. Pin Redline from the puzzle-piece menu.
 
-To update, unzip the new release over the same folder and click reload on Redline's card at `chrome://extensions`. You can also load a clone of this repository the same way.
+To update, replace the files in that folder with the new release's and click reload on Redline's card at `chrome://extensions`. Keep the folder where it is: Chrome ties Redline's notes, History and shortcut to its location. You can also load a clone of this repository the same way.
 
 A welcome page opens with your shortcut and a card to practice on. If <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> doesn't trigger Redline, another extension probably owns it. Pick a different one at `chrome://extensions/shortcuts`.
 
