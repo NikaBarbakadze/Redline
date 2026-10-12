@@ -42,12 +42,14 @@ It replaces the usual loop of screenshot → switch to the chat → paste → de
 
 ## Install
 
-Redline isn't on the Chrome Web Store yet. To install it from source:
+Redline isn't on the Chrome Web Store. Install it from a release:
 
-1. Clone or download this repository.
+1. Download `redline-<version>.zip` from the [latest release](https://github.com/NikaBarbakadze/Redline/releases/latest) and unzip it into a folder you'll keep. Chrome runs it from there.
 2. Open `chrome://extensions` and turn on **Developer mode**.
-3. Click **Load unpacked** and select the repository folder.
+3. Click **Load unpacked** and select the unzipped folder.
 4. Pin Redline from the puzzle-piece menu.
+
+To update, unzip the new release over the same folder and click reload on Redline's card at `chrome://extensions`. You can also load a clone of this repository the same way.
 
 A welcome page opens with your shortcut and a card to practice on. If <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> doesn't trigger Redline, another extension probably owns it. Pick a different one at `chrome://extensions/shortcuts`.
 
