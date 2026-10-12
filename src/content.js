@@ -237,6 +237,29 @@
     for (const h of [host, pinsHost]) h?.style.setProperty('visibility', hidden ? 'hidden' : 'visible', 'important');
   }
 
+  // A clicked button keeps focus even after its panel hides, and keys on it
+  // never reach the page (see isolate), so a later Esc went nowhere until you
+  // clicked the page. Mouse clicks give focus straight back; keyboard
+  // activation (detail 0) keeps it.
+  function dropButtonFocus(e, scope) {
+    if (!e.detail) return;
+    queueMicrotask(() => {
+      const active = scope.activeElement;
+      if (active?.tagName === 'BUTTON') active.blur();
+    });
+  }
+
+  // Esc on anything inside Redline that didn't handle it itself (the composer
+  // and note fields do) gets the usual "close what's open, else hide".
+  function keepEscape(scope) {
+    scope.addEventListener('keydown', (e) => {
+      if (e.key !== 'Escape' || e.defaultPrevented || e.isComposing) return;
+      e.preventDefault();
+      if (IS_TOP) escape();
+      else toParent({ type: 'esc' });
+    });
+  }
+
   // Keep keystrokes typed into Redline away from the page's own shortcuts.
   function isolate(rootNode) {
     const events = ['keydown', 'keyup', 'keypress', 'input', 'paste', 'copy', 'cut', 'focusin', 'focusout', 'wheel'];
@@ -251,7 +274,9 @@
     root.addEventListener('click', (e) => {
       const act = e.target.closest('[data-act]')?.dataset.act;
       if (act) actions[act]?.(e);
+      dropButtonFocus(e, root);
     });
+    keepEscape(root);
 
     // Composer
     $.input.addEventListener('keydown', (e) => {
@@ -342,6 +367,7 @@
     closeLightbox();
     mode = 'picking';
     if (IS_TOP) setUiHidden(false);
+    if (IS_TOP && !document.hasFocus()) window.focus();
     ensureUI();
     raise();
     if (IS_TOP) {
@@ -1471,7 +1497,9 @@
       pin.addEventListener('pointerleave', () => pinsLayer.classList.remove('quiet'), { once: true });
       const item = session?.items.find((i) => i.id === pin.dataset.id);
       if (item) closeSheet(), showItem(item);
+      dropButtonFocus(e, shadow);
     });
+    keepEscape(shadow);
     document.documentElement.append(pinsHost);
   }
 
