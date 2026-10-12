@@ -26,6 +26,7 @@
   let history = null; // History summaries, newest first (loaded when the sheet opens)
   let entry = null; // the archived session open in the sheet
   let uiHidden = false; // Esc tucked the dock and pins away (all tabs) until the next capture
+  let target = 'code'; // where notes go: 'code' (copy, Claude Code reads the files) or 'chat' (claude.ai)
   let shortcutLabel = isMac ? '⌘⇧S' : 'Ctrl+Shift+S';
   let myTabId = null;
   const pointer = { x: -1, y: -1 };
@@ -73,9 +74,10 @@
   }
 
   function onStorage(changes, area) {
-    if (area !== 'local' || !(KEY in changes || 'uiHidden' in changes)) return;
+    if (area !== 'local' || !(KEY in changes || 'uiHidden' in changes || 'target' in changes)) return;
     if (KEY in changes) session = changes[KEY].newValue ?? null;
     if ('uiHidden' in changes) uiHidden = !!changes.uiHidden.newValue;
+    if ('target' in changes) target = changes.target.newValue === 'chat' ? 'chat' : 'code';
     render();
   }
 
@@ -304,6 +306,7 @@
     close: () => closeSheet(),
     copy: (e) => copyAll(e.target.closest('button')),
     copyEntry: (e) => copyAll(e.target.closest('button'), entry?.id),
+    target: (e) => setTarget(e.target.closest('[data-target]').dataset.target),
     clear: () => clearSession(),
     view: (e) => setSheetView(e.target.closest('[data-view]').dataset.view),
     back: () => setSheetView('history'),
@@ -965,6 +968,7 @@
   async function copyAll(button, historyId = null) {
     const count = historyId ? (entry?.items.length ?? 0) : (session?.items.length ?? 0);
     if (!count) return toast('Nothing to copy yet');
+    if (target === 'chat') return sendToChat(button, historyId);
     button?.classList.add('busy');
     try {
       const { text } = await send({ type: 'export', id: historyId });
@@ -995,6 +999,82 @@
     } finally {
       button?.classList.remove('busy');
     }
+  }
+
+  // claude.ai can't open files on your Mac, so the screenshots travel as
+  // attachments: the worker opens a new chat and Redline there fills it in.
+  async function sendToChat(button, historyId) {
+    button?.classList.add('busy');
+    try {
+      await send({ type: 'sendToChat', id: historyId });
+      if (historyId && entry?.id === historyId) entry.copiedAt = entry.archivedAt = Date.now();
+      await syncSession();
+      refreshHistory();
+    } catch (err) {
+      toast(`Couldn’t open claude.ai: ${err.message}`, { error: true });
+    } finally {
+      button?.classList.remove('busy');
+    }
+  }
+
+  // In the new claude.ai tab: attach the screenshots and type the prompt.
+  async function fillChat({ files, text }) {
+    const find = () => ({
+      input: document.querySelector('input[data-testid="file-upload"]') ?? document.querySelector('input[type="file"][multiple]'),
+      editor:
+        document.querySelector('[data-testid="chat-input"]') ??
+        document.querySelector('.ProseMirror[contenteditable="true"], div[contenteditable="true"]'),
+    });
+    let el = find();
+    for (let i = 0; (!el.input || !el.editor) && i < 100; i++) {
+      await new Promise((r) => setTimeout(r, 150));
+      el = find();
+    }
+    if (!el.input || !el.editor) {
+      toast('Couldn’t find the chat box. Are you logged in to claude.ai?', { error: true });
+      return { ok: false, error: 'couldn’t find the chat box (are you logged in?)' };
+    }
+    const attach = new DataTransfer();
+    for (const f of files) attach.items.add(new File([dataUrlToBlob(f.dataUrl)], f.name, { type: 'image/png' }));
+    el.input.files = attach.files;
+    el.input.dispatchEvent(new Event('change', { bubbles: true }));
+    el.editor.focus();
+    document.execCommand('insertText', false, text);
+    toast(`Added ${plural(files.length, 'screenshot')} and your notes. Review, then send.`, { ok: true });
+    return { ok: true };
+  }
+
+  function dataUrlToBlob(dataUrl) {
+    const [head, body] = dataUrl.split(',');
+    const bytes = atob(body);
+    const buf = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) buf[i] = bytes.charCodeAt(i);
+    return new Blob([buf], { type: head.match(/data:([^;]+)/)?.[1] ?? 'image/png' });
+  }
+
+  function setTarget(value) {
+    target = value === 'chat' ? 'chat' : 'code';
+    render();
+    chrome.storage.local.set({ target }).catch(() => {});
+  }
+
+  // Primary buttons and the switch follow the chosen destination.
+  function renderTarget() {
+    const chat = target === 'chat';
+    for (const b of root.querySelectorAll('[data-act="copy"], [data-act="copyEntry"]')) {
+      b.querySelector('.lbl').textContent = chat ? 'Open in claude.ai' : 'Copy for Claude';
+      b.querySelector('.ic:not(.ok)').innerHTML = chat ? ICON.open : ICON.copy;
+      b.title = chat
+        ? 'Open a new claude.ai chat with the screenshots attached and the notes filled in'
+        : 'Save screenshots and copy everything for Claude Code';
+    }
+    for (const b of $.dest.querySelectorAll('[data-target]')) {
+      b.classList.toggle('on', b.dataset.target === target);
+      b.setAttribute('aria-selected', b.dataset.target === target);
+    }
+    $.shNote.textContent = chat
+      ? 'Opens claude.ai with the screenshots attached; you press send.'
+      : 'Screenshots are saved to Downloads/Redline and linked in the text.';
   }
 
   // Sets the current notes aside (into History) without copying them.
@@ -1211,7 +1291,7 @@
     $.entryDelete.hidden = view !== 'entry';
     $.footCurrent.hidden = view !== 'current' || !items.length;
     $.footEntry.hidden = view !== 'entry';
-    $.shNote.hidden = $.footCurrent.hidden && $.footEntry.hidden;
+    $.bottom.hidden = $.footCurrent.hidden && $.footEntry.hidden;
     if (view === 'current') renderCurrent(items);
     else if (view === 'history') renderHistory();
     else renderEntry();
@@ -1481,6 +1561,7 @@
       $.dock.classList.toggle('on', showDock);
       $.dockCount.textContent = items.length;
       $.dockLabel.textContent = items.length === 1 ? 'note' : 'notes';
+      renderTarget();
       if (sheetOpen) renderSheet();
     }
     renderPins();
@@ -1731,6 +1812,11 @@
   function onMessage(msg, _sender, sendResponse) {
     if (msg?.target !== 'page') return false;
     if (IS_EXTENSION_PAGE && msg.tabId != null && myTabId != null && msg.tabId !== myTabId) return false;
+    if (msg.type === 'chatFill') {
+      if (!IS_TOP) return false;
+      domReady.then(() => fillChat(msg)).then(sendResponse, (err) => sendResponse({ ok: false, error: String(err?.message ?? err) }));
+      return true;
+    }
     if (msg.type?.startsWith('frame:')) {
       if (IS_TOP) return false;
       onFrameCommand(msg);
@@ -1804,9 +1890,10 @@
   const domReady = new Promise((resolve) =>
     document.readyState === 'loading' ? on(document, 'DOMContentLoaded', resolve, { once: true }) : resolve(),
   );
-  Promise.all([chrome.storage.local.get([KEY, 'uiHidden']), domReady]).then(([stored]) => {
+  Promise.all([chrome.storage.local.get([KEY, 'uiHidden', 'target']), domReady]).then(([stored]) => {
     session = stored[KEY] ?? null;
     uiHidden = !!stored.uiHidden;
+    target = stored.target === 'chat' ? 'chat' : 'code';
     pingChildren();
     render();
   });
@@ -1828,6 +1915,8 @@
       '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><rect x="7" y="7" width="10" height="10" rx="2.4"/><path d="M13 7V5.4A2.4 2.4 0 0 0 10.6 3H5.4A2.4 2.4 0 0 0 3 5.4v5.2A2.4 2.4 0 0 0 5.4 13H7"/></svg>',
     check:
       '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 10.5l3.5 3.5 7.5-8"/></svg>',
+    open:
+      '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M8.5 4.5H6A2.5 2.5 0 0 0 3.5 7v7A2.5 2.5 0 0 0 6 16.5h7a2.5 2.5 0 0 0 2.5-2.5v-2.5"/><path d="M11 3.5h5.5V9M16.5 3.5L9 11"/></svg>',
     chevronLeft:
       '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.5 4.5L7 10l5.5 5.5"/></svg>',
     chevronRight:
@@ -1923,6 +2012,14 @@
         <div class="sh-cards" data-ref="entryList"></div>
       </div>
 
+      <div class="sh-bottom" data-ref="bottom">
+      <div class="dest" data-ref="dest">
+        <span>Paste into</span>
+        <div class="seg sm" role="tablist">
+          <button data-act="target" data-target="code" role="tab">Claude Code</button>
+          <button data-act="target" data-target="chat" role="tab">claude.ai</button>
+        </div>
+      </div>
       <footer class="sh-foot" data-ref="footCurrent">
         <button class="btn ghost" data-act="clear" title="Move these notes to History and start fresh">New session</button>
         <button class="btn primary" data-act="copy">
@@ -1936,6 +2033,7 @@
         </button>
       </footer>
       <p class="sh-note" data-ref="shNote">Screenshots are saved to Downloads/Redline and linked in the text.</p>
+      </div>
     </aside>
 
     <div class="lb" data-ref="lb" data-act="unzoom" hidden><img data-ref="lbImg" alt=""></div>
@@ -2189,7 +2287,11 @@
   .sh-empty { flex: 1; display: grid; place-content: center; justify-items: center; gap: 14px; padding: 32px; text-align: center; color: var(--text2); line-height: 1.5; }
   .empty-ic { width: 56px; height: 56px; border-radius: 16px; display: grid; place-items: center; background: var(--fill); color: var(--text2); }
   .empty-ic svg { width: 26px; height: 26px; }
-  .sh-foot { display: flex; gap: 8px; padding: 12px 12px 6px; border-top: .5px solid var(--line); }
+  .sh-bottom { border-top: .5px solid var(--line); }
+  .dest { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 14px 0 16px; font-size: 12px; color: var(--text2); }
+  .seg.sm button { height: 22px; padding: 0 10px; font-size: 11.5px; border-radius: 6px; }
+  .seg.sm { border-radius: 8px; }
+  .sh-foot { display: flex; gap: 8px; padding: 10px 12px 6px; }
   .sh-foot .btn { height: 38px; border-radius: 11px; font-size: 13.5px; padding: 0 14px; }
   .sh-foot .primary { flex: 1; }
   .sh-note { padding: 2px 12px 12px; text-align: center; font-size: 11px; color: var(--text3); }

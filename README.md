@@ -69,6 +69,10 @@ Element screenshots include some surrounding context with the target outlined in
 
 The format is built for **Claude Code**, which opens the screenshots from those paths. Page, viewport and element details are only repeated per note when they differ.
 
+### Sending to claude.ai instead
+
+claude.ai can't open files on your computer, and the clipboard holds only one image, so the path-based copy doesn't work there. Switch **Paste into** (bottom of the panel) to **claude.ai** and the button becomes **Open in claude.ai**: it opens a new chat with every screenshot attached at full quality, each stamped with its note number, and the notes typed into the message box. Review it and press send. The session goes to History, same as a copy. The choice is remembered.
+
 ## How it works
 
 No build step and no dependencies.

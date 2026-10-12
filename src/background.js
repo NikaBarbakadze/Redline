@@ -173,7 +173,10 @@ async function makeThumb(dataUrl) {
   const ctx = canvas.getContext('2d');
   ctx.imageSmoothingQuality = 'high';
   ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
-  const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.82 });
+  return blobToDataUrl(await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.82 }));
+}
+
+function blobToDataUrl(blob) {
   return new Promise((resolve) => {
     const reader = new FileReader();
     reader.onload = () => resolve(reader.result);
@@ -262,17 +265,22 @@ function downloadFinished(id) {
 
 const pad = (n) => String(n).padStart(2, '0');
 
+// `paths` are the saved PNGs for Claude Code; null means the screenshots are
+// attached to a claude.ai chat instead, in order, each numbered in its corner.
 function buildPrompt(session, paths) {
   const items = session.items;
   const count = items.length;
   const same = (key) => new Set(items.map(key)).size === 1;
   const onePage = same((item) => item.url);
   const oneViewport = same(viewport);
+  const attached = !paths;
 
   const out = [
     `# UI changes (${count} ${count === 1 ? 'note' : 'notes'})`,
     '',
-    `I took these while reviewing the page in the browser. Each note pairs a screenshot with the change I want. The screenshots are local PNG files; open each one before making its change. In element screenshots the target is outlined in red.`,
+    attached
+      ? `I took these while reviewing the page in the browser. Each note has a screenshot attached, in the same order and marked with the note's number in its top-left corner. In element screenshots the target is outlined in red.`
+      : `I took these while reviewing the page in the browser. Each note pairs a screenshot with the change I want. The screenshots are local PNG files; open each one before making its change. In element screenshots the target is outlined in red.`,
     '',
   ];
   if (onePage) out.push(`Page: ${page(items[0])}`);
@@ -283,7 +291,7 @@ function buildPrompt(session, paths) {
     if (!onePage) out.push(`Page: ${page(item)}`);
     if (item.frameUrl) out.push(`Inside iframe: ${item.frameUrl}`);
     if (!oneViewport) out.push(`Viewport: ${viewport(item)}`);
-    out.push(`Screenshot: ${paths[i] ?? '(missing; the screenshot could not be saved)'}`);
+    out.push(attached ? `Screenshot: attached image ${i + 1}` : `Screenshot: ${paths[i] ?? '(missing; the screenshot could not be saved)'}`);
     const target = describeTarget(item);
     if (target) out.push(target);
     out.push(`Change: ${item.note.trim().replace(/\n/g, '\n  ') || '(no note; see screenshot)'}`);
@@ -306,6 +314,88 @@ function describeTarget(item) {
   if (item.kind === 'area') return t?.path ? `Area: a dragged region centered on \`${t.path}\`` : 'Area: a dragged region';
   if (!t?.path) return null;
   return `Element: \`${t.path}\`${t.text ? ` "${t.text}"` : ''}`;
+}
+
+// ---------------------------------------------------------------------------
+// Send to claude.ai: open a new chat and hand Redline's content script there the
+// numbered screenshots and the prompt. It attaches them and fills in the text;
+// you review and press send. The session is filed into History like a copy.
+
+const CHAT_URL = 'https://claude.ai/new';
+
+async function sendToChat(id, opener) {
+  const session = id ? await sessions.get(id) : await getSession();
+  if (!session?.items?.length) throw new Error('No notes to send yet');
+
+  const stored = await images.getMany(session.items.map((item) => item.id));
+  const files = (
+    await Promise.all(
+      session.items.map(async (item, i) =>
+        stored[item.id] ? { name: `redline-${pad(i + 1)}.png`, dataUrl: await numberImage(stored[item.id], i + 1) } : null,
+      ),
+    )
+  ).filter(Boolean);
+  const text = buildPrompt(session, null);
+
+  const tab = await chrome.tabs.create({
+    url: CHAT_URL,
+    ...(opener ? { openerTabId: opener.id, index: opener.index + 1, windowId: opener.windowId } : {}),
+  });
+  await fillChat(tab.id, { files, text });
+
+  if (id) {
+    const now = Date.now();
+    await sessions.put(id, { ...session, copiedAt: now, archivedAt: now });
+  } else {
+    await archive({ copied: true });
+  }
+  return { ok: true, count: session.items.length };
+}
+
+// The tab is still loading; keep asking until Redline is up in it and reports
+// back (it waits for the chat box itself).
+async function fillChat(tabId, payload) {
+  const deadline = Date.now() + 30000;
+  for (;;) {
+    let res;
+    try {
+      res = await chrome.tabs.sendMessage(tabId, { ...payload, type: 'chatFill', target: 'page' }, { frameId: 0 });
+    } catch {
+      if (Date.now() > deadline) throw new Error('claude.ai took too long to open');
+      await sleep(300);
+      continue;
+    }
+    if (res?.ok) return res;
+    throw new Error(res?.error ?? 'Couldn’t fill in the chat');
+  }
+}
+
+// The note's number in the screenshot's corner, so each image maps to its note
+// even if the chat reorders attachments.
+async function numberImage(dataUrl, n) {
+  const bitmap = await createImageBitmap(await (await fetch(dataUrl)).blob());
+  const canvas = new OffscreenCanvas(bitmap.width, bitmap.height);
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(bitmap, 0, 0);
+  const r = Math.round(Math.max(14, Math.min(34, Math.min(bitmap.width, bitmap.height) * 0.05)));
+  const c = Math.round(r * 1.6);
+  ctx.shadowColor = 'rgba(0,0,0,0.3)';
+  ctx.shadowBlur = r * 0.4;
+  ctx.fillStyle = '#FFFFFF';
+  ctx.beginPath();
+  ctx.arc(c, c, r + Math.max(2, r * 0.14), 0, Math.PI * 2);
+  ctx.fill();
+  ctx.shadowColor = 'transparent';
+  ctx.fillStyle = '#FF3B30';
+  ctx.beginPath();
+  ctx.arc(c, c, r, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = `600 ${Math.round(r * 1.15)}px -apple-system, "Helvetica Neue", Arial, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(String(n), c, c + r * 0.05);
+  return blobToDataUrl(await canvas.convertToBlob({ type: 'image/png' }));
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +478,7 @@ const handlers = {
   },
   gc: () => collectGarbage(),
   export: ({ id }) => exportSession(id),
+  sendToChat: ({ id }, sender) => sendToChat(id, sender.tab),
   archive: ({ copied }) => archive({ copied: !!copied }),
   reopen: ({ id }) => reopen(id),
   history: () => listHistory(),
@@ -428,8 +519,9 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       return tellTab(tab, { type: 'history' });
     case 'copy':
       if (await tellTab(tab, { type: 'copy' })) return;
-      // No page UI available: copy straight from here.
+      // No page UI available: do it from here.
       try {
+        if ((await chrome.storage.local.get('target')).target === 'chat') return await sendToChat(null, tab);
         await copyText((await exportSession()).text);
         await archive({ copied: true });
       } catch {}
@@ -451,7 +543,7 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
     const menu = [
       ['review', 'Review notes'],
       ['history', 'History'],
-      ['copy', 'Copy notes for Claude'],
+      ['copy', 'Copy / send notes to Claude'],
       ['clear', 'Start a new session'],
       ['shortcuts', 'Change keyboard shortcut…'],
     ];
