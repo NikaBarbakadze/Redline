@@ -34,9 +34,10 @@ The welcome page that opens shows your shortcut and has a card to practice on.
 - Works inside iframes, including cross-origin ones like an embedded app in Shopify admin or the theme editor preview. The note records the iframe's URL (path only, so session tokens stay out) and the element path inside it.
 - Red numbered pins mark what you've already covered. Hover one to read the note, click it to edit.
 - The dock in the corner shows the count and has **Copy for Claude**. Click the count to review: edit notes inline, zoom screenshots, delete (with undo).
-- A session spans tabs and pages until you start a new one.
+- A session spans tabs and pages. **Copying closes it**: it moves to History and your next note starts again at 1, so a forgotten "new session" can't mix batches. Copied too early? **Keep adding** in the toast reopens it.
+- **History** (the second tab in the panel, or right-click the icon → History) keeps your last 50 sessions. Open one to see its notes and screenshots, copy it again (same file paths), or **Continue** it to add more notes. Anything in progress is set aside into History first, so nothing is lost.
 
-Right-click the toolbar icon for Review / Copy / New session / Change shortcut. If <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> doesn't fire, another extension probably owns it; set one at `chrome://extensions/shortcuts`.
+Right-click the toolbar icon for Review / History / Copy / New session / Change shortcut. If <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> doesn't fire, another extension probably owns it; set one at `chrome://extensions/shortcuts`.
 
 ![Review sheet](docs/sheet.png)
 
@@ -72,7 +73,7 @@ The format is built for **Claude Code**, which opens the screenshots from those 
 No build step and no dependencies.
 
 - `src/content.js`: all in-page UI (picker, composer, pins, dock, review sheet) in a shadow root. It runs in every frame. Child frames pick on their own and post the result to their parent, which offsets it by the `<iframe>`'s content box and passes it up until the top frame takes the screenshot and opens the composer. Keys follow the pointer between frames. The host is a manual popover so it sits in the top layer above the page's own modals. When a modal `<dialog>` is open, it moves inside the dialog so it isn't inert. Idle cost on a page is one storage read and a pointer listener.
-- `src/background.js`: captures the tab, keeps screenshots in IndexedDB (session metadata lives in `chrome.storage`, so tabs don't sync megabytes of base64), writes the PNGs with the download bubble suppressed and history cleaned up, and builds the prompt.
+- `src/background.js`: captures the tab, keeps screenshots, thumbnails and session History in IndexedDB (only the active session lives in `chrome.storage`, so tabs stay in sync without passing megabytes of base64 around), writes the PNGs with the download bubble suppressed and the downloads list cleaned up, and builds the prompt.
 - `src/offscreen.*`: clipboard fallback for when the page can't write it.
 
 Nothing leaves your machine.

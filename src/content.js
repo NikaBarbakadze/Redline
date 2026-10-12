@@ -22,6 +22,9 @@
   let session = null; // { id, folder, createdAt, items: [...] }
   let mode = 'idle'; // idle | picking | capturing | composing
   let sheetOpen = false;
+  let sheetView = 'current'; // current | history | entry
+  let history = null; // History summaries, newest first (loaded when the sheet opens)
+  let entry = null; // the archived session open in the sheet
   let shortcutLabel = isMac ? '⌘⇧S' : 'Ctrl+Shift+S';
   let myTabId = null;
   const pointer = { x: -1, y: -1 };
@@ -291,7 +294,13 @@
     review: () => openSheet(),
     close: () => closeSheet(),
     copy: (e) => copyAll(e.target.closest('button')),
+    copyEntry: (e) => copyAll(e.target.closest('button'), entry?.id),
     clear: () => clearSession(),
+    view: (e) => setSheetView(e.target.closest('[data-view]').dataset.view),
+    back: () => setSheetView('history'),
+    openEntry: (e) => openEntry(e.target.closest('[data-id]').dataset.id),
+    reopen: (e) => reopenSession(e.target.closest('[data-id]')?.dataset.id ?? entry?.id),
+    deleteEntry: () => deleteEntry(),
     shortcuts: () => send({ type: 'openShortcuts' }).catch(() => {}),
     zoom: (e) => openLightbox(e.target.closest('.card').dataset.id),
     unzoom: () => closeLightbox(),
@@ -928,22 +937,36 @@
   // -------------------------------------------------------------------------
   // Copy for Claude
 
-  async function copyAll(button) {
-    const count = session?.items.length ?? 0;
+  // A copy closes the session: it moves to History and the next note starts a
+  // fresh one. `historyId` re-copies a session from History instead.
+  async function copyAll(button, historyId = null) {
+    const count = historyId ? (entry?.items.length ?? 0) : (session?.items.length ?? 0);
     if (!count) return toast('Nothing to copy yet');
     button?.classList.add('busy');
     try {
-      const { text } = await send({ type: 'export' });
+      const { text } = await send({ type: 'export', id: historyId });
       try {
         await navigator.clipboard.writeText(text);
       } catch {
         await send({ type: 'copyText', text });
       }
-      for (const b of root.querySelectorAll('[data-act="copy"]')) {
+      for (const b of root.querySelectorAll('[data-act="copy"], [data-act="copyEntry"]')) {
         b.classList.add('done');
         setTimeout(() => b.classList.remove('done'), 1600);
       }
-      toast(`Copied ${plural(count, 'note')}. Paste into Claude.`, { ok: true, action: 'New session', onAction: () => clearSession() });
+      if (historyId) {
+        if (entry?.id === historyId) entry.copiedAt = entry.archivedAt = Date.now();
+        toast(`Copied ${plural(count, 'note')}. Paste into Claude.`, { ok: true });
+      } else {
+        const { id } = await send({ type: 'archive', copied: true });
+        await syncSession();
+        toast(`Copied ${plural(count, 'note')}. Paste into Claude.`, {
+          ok: true,
+          action: 'Keep adding',
+          onAction: () => reopenSession(id, { quiet: true }),
+        });
+      }
+      refreshHistory();
     } catch (err) {
       toast(`Couldn’t copy: ${err.message}`, { error: true });
     } finally {
@@ -951,16 +974,68 @@
     }
   }
 
+  // Sets the current notes aside (into History) without copying them.
   async function clearSession() {
-    const previous = await readSession();
-    if (!previous) return;
-    closeSheet();
-    await chrome.storage.local.remove(KEY);
-    session = null;
+    if (!session?.items?.length) return;
+    try {
+      const { id } = await send({ type: 'archive', copied: false });
+      await syncSession();
+      toast('Moved to History', { action: 'Undo', onAction: () => reopenSession(id, { quiet: true }) });
+      refreshHistory();
+    } catch (err) {
+      toast(`Couldn’t start a new session: ${err.message}`, { error: true });
+    }
+  }
+
+  // Makes a History session the active one again; new notes join it.
+  async function reopenSession(id, { quiet = false } = {}) {
+    if (!id) return;
+    try {
+      const { count } = await send({ type: 'reopen', id });
+      await syncSession();
+      if (sheetOpen) setSheetView('current');
+      refreshHistory();
+      if (!quiet) toast(`Continuing a session of ${plural(count, 'note')}. New notes join it.`, { ok: true });
+    } catch (err) {
+      toast(err.message, { error: true });
+    }
+  }
+
+  // The worker changed the active session; don't wait for the storage event.
+  async function syncSession() {
+    session = await readSession();
     render();
-    toast('New session started', {
+  }
+
+  async function refreshHistory() {
+    if (!IS_TOP) return;
+    try {
+      history = (await send({ type: 'history' })).sessions;
+    } catch {
+      history = [];
+    }
+    if (sheetOpen) renderSheet();
+  }
+
+  async function openEntry(id) {
+    const { session: s } = await send({ type: 'historyGet', id }).catch(() => ({}));
+    if (!s) return refreshHistory();
+    entry = s;
+    setSheetView('entry');
+  }
+
+  async function deleteEntry() {
+    const s = entry;
+    if (!s) return;
+    await send({ type: 'historyDelete', id: s.id }).catch(() => {});
+    setSheetView('history');
+    await refreshHistory();
+    toast('Session deleted', {
       action: 'Undo',
-      onAction: () => chrome.storage.local.set({ [KEY]: previous }),
+      onAction: async () => {
+        await send({ type: 'historyRestore', session: s });
+        refreshHistory();
+      },
       onExpire: () => send({ type: 'gc' }).catch(() => {}),
     });
   }
@@ -968,13 +1043,15 @@
   // -------------------------------------------------------------------------
   // Review sheet
 
-  function openSheet() {
+  function openSheet(view = 'current') {
     if (mode === 'picking') stopPicking();
     if (mode !== 'idle') return;
     sheetOpen = true;
+    sheetView = view;
     ensureUI();
     raise();
     render();
+    refreshHistory();
     requestAnimationFrame(() => $.sheet.classList.add('on'));
     on(window, 'keydown', onSheetKey, { capture: true });
   }
@@ -985,6 +1062,7 @@
     e.preventDefault();
     e.stopImmediatePropagation();
     if (lightboxOpen) closeLightbox();
+    else if (sheetView === 'entry') setSheetView('history');
     else closeSheet();
   }
 
@@ -997,15 +1075,58 @@
     render();
   }
 
+  function setSheetView(view) {
+    const back = sheetView === 'entry' && view === 'history';
+    const forward = view === 'entry';
+    sheetView = view;
+    if (view !== 'entry') {
+      entry = null;
+      $.entryList.dataset.id = '';
+    }
+    renderSheet();
+    const pane = $[`pane_${view}`];
+    pane.classList.remove('push', 'pop', 'fade');
+    void pane.offsetWidth;
+    pane.classList.add(forward ? 'push' : back ? 'pop' : 'fade');
+    pane.scrollTop = 0;
+  }
+
   function renderSheet() {
+    const view = sheetView;
     const items = session?.items ?? [];
+    for (const v of ['current', 'history', 'entry']) $[`pane_${v}`].hidden = v !== view;
+    for (const b of $.seg.querySelectorAll('[data-view]')) {
+      b.classList.toggle('on', b.dataset.view === view);
+      b.setAttribute('aria-selected', b.dataset.view === view);
+    }
+    $.seg.hidden = view === 'entry';
+    $.back.hidden = view !== 'entry';
+    $.entryDelete.hidden = view !== 'entry';
+    $.footCurrent.hidden = view !== 'current' || !items.length;
+    $.footEntry.hidden = view !== 'entry';
+    $.shNote.hidden = $.footCurrent.hidden && $.footEntry.hidden;
+    if (view === 'current') renderCurrent(items);
+    else if (view === 'history') renderHistory();
+    else renderEntry();
+  }
+
+  function renderCurrent(items) {
     const pages = new Set(items.map((i) => i.url)).size;
+    $.sheetTitle.textContent = 'Notes';
     $.sheetSub.textContent = items.length
       ? `${plural(items.length, 'note')}${pages > 1 ? ` across ${pages} pages` : ''}`
       : 'Nothing captured yet';
     $.empty.hidden = items.length > 0;
     $.list.hidden = !items.length;
-    for (const b of root.querySelectorAll('.sh-foot button')) b.disabled = !items.length;
+
+    // Empty: offer to pick up the most recent session.
+    const last = !items.length && history?.[0];
+    $.last.hidden = !last;
+    if (last) {
+      $.lastBtn.dataset.id = last.id;
+      $.lastTitle.textContent = last.title;
+      $.lastMeta.textContent = `${last.copiedAt ? 'Copied' : 'Set aside'} ${ago(last.archivedAt)} · ${plural(last.count, 'note')}`;
+    }
 
     const cards = new Map([...$.list.children].map((c) => [c.dataset.id, c]));
     items.forEach((item, i) => {
@@ -1015,21 +1136,99 @@
       card.querySelector('.num').textContent = i + 1;
       const ta = card.querySelector('.card-note');
       if (root.activeElement !== ta && ta.value !== item.note) ta.value = item.note;
-      const img = card.querySelector('img');
-      const src = imageCache.get(item.id);
-      if (src && img.getAttribute('src') !== src) img.src = src;
+      setSrc(card.querySelector('img'), imageCache.get(item.id));
       if ($.list.children[i] !== card) $.list.insertBefore(card, $.list.children[i] ?? null);
     });
     for (const card of cards.values()) card.remove();
-    loadThumbs(items);
+    loadImages(items.map((i) => i.id));
   }
 
-  const requested = new Set(); // ask the worker once per thumbnail
-  function loadThumbs(items) {
-    const ids = items.map((i) => i.id).filter((id) => !imageCache.has(id) && !requested.has(id));
-    if (!ids.length) return;
-    ids.forEach((id) => requested.add(id));
-    send({ type: 'getImages', ids })
+  function renderHistory() {
+    const rows = history ?? [];
+    $.sheetTitle.textContent = 'History';
+    $.sheetSub.textContent = history ? (rows.length ? plural(rows.length, 'session') : 'Nothing here yet') : '';
+    $.historyEmpty.hidden = !history || rows.length > 0;
+
+    const groups = [];
+    for (const row of rows) {
+      const label = dayLabel(row.archivedAt);
+      if (groups.at(-1)?.label !== label) groups.push({ label, rows: [] });
+      groups.at(-1).rows.push(row);
+    }
+    $.historyList.replaceChildren(
+      ...groups.map((g) => {
+        const section = document.createElement('section');
+        section.className = 'grp';
+        section.innerHTML = `<h3></h3><div class="grp-list"></div>`;
+        section.firstChild.textContent = g.label;
+        section.lastChild.append(...g.rows.map(makeRow));
+        return section;
+      }),
+    );
+    loadRowThumbs(rows.map((r) => r.thumbId));
+  }
+
+  function makeRow(r) {
+    const row = document.createElement('button');
+    row.className = 'row';
+    row.dataset.act = 'openEntry';
+    row.dataset.id = r.id;
+    row.innerHTML = `
+      <span class="row-main"><span class="row-title"></span><span class="row-meta"></span><span class="row-prev"></span></span>
+      <img class="row-thumb" alt="">
+      <span class="row-chev">${ICON.chevronRight}</span>`;
+    row.querySelector('.row-title').textContent = r.title;
+    row.querySelector('.row-meta').textContent = [
+      clock(r.archivedAt),
+      plural(r.count, 'note'),
+      r.pages > 1 ? `${r.pages} pages` : r.host,
+      r.copiedAt ? '' : 'Not copied',
+    ]
+      .filter(Boolean)
+      .join(' · ');
+    row.querySelector('.row-prev').textContent = r.preview;
+    setSrc(row.querySelector('img'), thumbCache.get(r.thumbId));
+    return row;
+  }
+
+  function renderEntry() {
+    const s = entry;
+    if (!s) return;
+    $.sheetTitle.textContent = s.items[0]?.title || 'Session';
+    $.sheetSub.textContent = `${plural(s.items.length, 'note')} · ${s.copiedAt ? 'copied' : 'set aside'} ${ago(s.archivedAt)}`;
+    if ($.entryList.dataset.id !== s.id) {
+      $.entryList.dataset.id = s.id;
+      $.entryList.replaceChildren(
+        ...s.items.map((item, i) => {
+          const card = document.createElement('article');
+          card.className = 'card ro';
+          card.dataset.id = item.id;
+          card.innerHTML = `
+            <div class="card-shot" data-act="zoom"><img alt=""><span class="num"></span></div>
+            <p class="card-text"></p>
+            <div class="card-meta"><span class="mono"></span><span class="where"></span></div>`;
+          card.querySelector('.num').textContent = i + 1;
+          card.querySelector('.card-text').textContent = item.note;
+          card.querySelector('.mono').textContent = itemLabel(item);
+          card.querySelector('.where').textContent = shortUrl(item.url);
+          return card;
+        }),
+      );
+    }
+    for (const card of $.entryList.children) setSrc(card.querySelector('img'), imageCache.get(card.dataset.id));
+    loadImages(s.items.map((i) => i.id));
+  }
+
+  function setSrc(img, src) {
+    if (src && img.getAttribute('src') !== src) img.src = src;
+  }
+
+  const requested = new Set(); // ask the worker once per screenshot
+  function loadImages(ids) {
+    const want = ids.filter((id) => !imageCache.has(id) && !requested.has(id));
+    if (!want.length) return;
+    want.forEach((id) => requested.add(id));
+    send({ type: 'getImages', ids: want })
       .then((found) => {
         for (const [id, url] of Object.entries(found)) imageCache.set(id, url);
         if (sheetOpen) renderSheet();
@@ -1037,12 +1236,52 @@
       .catch(() => {});
   }
 
+  const thumbCache = new Map();
+  const thumbRequested = new Set();
+  function loadRowThumbs(ids) {
+    const want = ids.filter((id) => id && !thumbCache.has(id) && !thumbRequested.has(id));
+    if (!want.length) return;
+    want.forEach((id) => thumbRequested.add(id));
+    send({ type: 'thumbs', ids: want })
+      .then((found) => {
+        for (const [id, url] of Object.entries(found)) thumbCache.set(id, url);
+        if (sheetOpen && sheetView === 'history') renderSheet();
+      })
+      .catch(() => {});
+  }
+
+  function dayLabel(ts) {
+    const day = new Date(ts).setHours(0, 0, 0, 0);
+    const diff = Math.round((new Date().setHours(0, 0, 0, 0) - day) / 86400000);
+    if (diff === 0) return 'Today';
+    if (diff === 1) return 'Yesterday';
+    return new Date(ts).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+  }
+
+  const clock = (ts) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+  // "today", "yesterday", "on Mon, Oct 6"
+  function relDay(ts) {
+    const d = dayLabel(ts);
+    return d === 'Today' || d === 'Yesterday' ? d.toLowerCase() : `on ${d}`;
+  }
+
+  function ago(ts) {
+    const mins = Math.round((Date.now() - ts) / 60000);
+    if (mins < 1) return 'just now';
+    if (mins < 60) return `${mins} min ago`;
+    return `${relDay(ts)} at ${clock(ts)}`;
+  }
+
+  const itemLabel = (item) =>
+    item.kind === 'screen' ? 'Whole screen' : item.kind === 'area' ? 'Area' : item.target?.label ?? 'Element';
+
   function makeCard(item) {
     const card = document.createElement('article');
     card.className = 'card';
     card.dataset.id = item.id;
     const where = item.url === pageKey() ? 'This page' : shortUrl(item.url);
-    const what = item.kind === 'screen' ? 'Whole screen' : item.kind === 'area' ? 'Area' : item.target?.label ?? 'Element';
+    const what = itemLabel(item);
     card.innerHTML = `
       <div class="card-shot" data-act="zoom">
         <img alt="">
@@ -1390,6 +1629,9 @@
       case 'review':
         openSheet();
         break;
+      case 'history':
+        openSheet('history');
+        break;
       case 'copy':
         copyAll();
         break;
@@ -1461,6 +1703,12 @@
       '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><rect x="7" y="7" width="10" height="10" rx="2.4"/><path d="M13 7V5.4A2.4 2.4 0 0 0 10.6 3H5.4A2.4 2.4 0 0 0 3 5.4v5.2A2.4 2.4 0 0 0 5.4 13H7"/></svg>',
     check:
       '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4.5 10.5l3.5 3.5 7.5-8"/></svg>',
+    chevronLeft:
+      '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.5 4.5L7 10l5.5 5.5"/></svg>',
+    chevronRight:
+      '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 5l5 5-5 5"/></svg>',
+    history:
+      '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3.5 10a6.5 6.5 0 1 0 1.9-4.6M3.5 3.8v2.6h2.6"/><path d="M10 6.8V10l2.3 1.6"/></svg>',
     warn:
       '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="10" cy="10" r="7.2"/><path d="M10 6.4v4.3M10 13.4v.1"/></svg>',
   };
@@ -1510,23 +1758,59 @@
 
     <aside class="sheet glass" data-ref="sheet" aria-label="Redline notes">
       <header class="sh-head">
-        <div class="sh-titles"><h2>Notes</h2><p data-ref="sheetSub"></p></div>
+        <div class="seg" data-ref="seg" role="tablist">
+          <button data-act="view" data-view="current" role="tab">Current</button>
+          <button data-act="view" data-view="history" role="tab">History</button>
+        </div>
+        <button class="back" data-act="back" data-ref="back" hidden>${ICON.chevronLeft}<span>History</span></button>
+        <span class="sp"></span>
+        <button class="icon-btn" data-act="deleteEntry" data-ref="entryDelete" title="Delete this session" hidden>${ICON.trash}</button>
         <button class="icon-btn" data-act="capture" title="Capture">${ICON.capture}</button>
         <button class="icon-btn" data-act="close" title="Close (esc)">${ICON.close}</button>
       </header>
-      <div class="sh-list" data-ref="list"></div>
-      <div class="sh-empty" data-ref="empty" hidden>
-        <div class="empty-ic">${ICON.capture}</div>
-        <p>Press <kbd data-shortcut></kbd> on any page,<br>click what needs work, and say what should change.</p>
-        <button class="link" data-act="shortcuts">Change shortcut</button>
+      <div class="sh-titles"><h2 data-ref="sheetTitle">Notes</h2><p data-ref="sheetSub"></p></div>
+
+      <div class="pane" data-ref="pane_current">
+        <div class="sh-list" data-ref="list"></div>
+        <div class="sh-empty" data-ref="empty" hidden>
+          <div class="empty-ic">${ICON.capture}</div>
+          <p>Press <kbd data-shortcut></kbd> on any page,<br>click what needs work, and say what should change.</p>
+          <button class="link" data-act="shortcuts">Change shortcut</button>
+        </div>
+        <div class="last" data-ref="last" hidden>
+          <div class="last-h">Last session</div>
+          <div class="last-row">
+            <div class="last-text"><div class="row-title" data-ref="lastTitle"></div><div class="row-meta" data-ref="lastMeta"></div></div>
+            <button class="btn ghost" data-act="reopen" data-ref="lastBtn" title="Make it the current session and add more notes">Continue</button>
+          </div>
+        </div>
       </div>
-      <footer class="sh-foot">
-        <button class="btn ghost" data-act="clear">New session</button>
+
+      <div class="pane scroll" data-ref="pane_history" hidden>
+        <div data-ref="historyList"></div>
+        <div class="sh-empty" data-ref="historyEmpty" hidden>
+          <div class="empty-ic">${ICON.history}</div>
+          <p>Every time you copy, the session lands here<br>and the next note starts a fresh one.</p>
+        </div>
+      </div>
+
+      <div class="pane scroll" data-ref="pane_entry" hidden>
+        <div class="sh-cards" data-ref="entryList"></div>
+      </div>
+
+      <footer class="sh-foot" data-ref="footCurrent">
+        <button class="btn ghost" data-act="clear" title="Move these notes to History and start fresh">New session</button>
         <button class="btn primary" data-act="copy">
           <span class="ic">${ICON.copy}</span><span class="ic ok">${ICON.check}</span>${SPINNER}<span class="lbl">Copy for Claude</span>
         </button>
       </footer>
-      <p class="sh-note">Screenshots are saved to Downloads/Redline and linked in the text.</p>
+      <footer class="sh-foot" data-ref="footEntry" hidden>
+        <button class="btn ghost" data-act="reopen" title="Make it the current session and add more notes">Continue</button>
+        <button class="btn primary" data-act="copyEntry">
+          <span class="ic">${ICON.copy}</span><span class="ic ok">${ICON.check}</span>${SPINNER}<span class="lbl">Copy for Claude</span>
+        </button>
+      </footer>
+      <p class="sh-note" data-ref="shNote">Screenshots are saved to Downloads/Redline and linked in the text.</p>
     </aside>
 
     <div class="lb" data-ref="lb" data-act="unzoom" hidden><img data-ref="lbImg" alt=""></div>
@@ -1553,7 +1837,7 @@
   .r {
     --blue: #007aff; --red: #ff3b30; --green: #28cd41;
     --text: rgba(0,0,0,.86); --text2: rgba(60,60,67,.64); --text3: rgba(60,60,67,.34);
-    --glass: rgba(246,246,248,.74); --solid: rgba(252,252,253,.92); --card: rgba(255,255,255,.9);
+    --glass: rgba(246,246,248,.74); --solid: rgba(252,252,253,.92); --card: rgba(255,255,255,.9); --seg-on: #fff;
     --line: rgba(0,0,0,.09); --fill: rgba(118,118,128,.12); --fill2: rgba(118,118,128,.2);
     --shadow: 0 0 0 .5px rgba(0,0,0,.14), 0 1px 2px rgba(0,0,0,.06), 0 12px 40px -8px rgba(0,0,0,.24);
     --ease: cubic-bezier(.32,.72,0,1);
@@ -1566,7 +1850,7 @@
     .r {
       --blue: #0a84ff; --red: #ff453a; --green: #32d74b;
       --text: rgba(255,255,255,.92); --text2: rgba(235,235,245,.62); --text3: rgba(235,235,245,.32);
-      --glass: rgba(40,40,44,.8); --solid: rgba(38,38,42,.94); --card: rgba(255,255,255,.06);
+      --glass: rgba(40,40,44,.8); --solid: rgba(38,38,42,.94); --card: rgba(255,255,255,.06); --seg-on: #636366;
       --line: rgba(255,255,255,.1); --fill: rgba(118,118,128,.24); --fill2: rgba(118,118,128,.36);
       --shadow: 0 0 0 .5px rgba(255,255,255,.14), 0 0 0 1px rgba(0,0,0,.45), 0 16px 48px -8px rgba(0,0,0,.65);
     }
@@ -1707,11 +1991,27 @@
     pointer-events: none; transform: translateX(calc(100% + 32px)); transition: transform .5s var(--ease);
   }
   .sheet.on { transform: none; pointer-events: auto; }
-  .sh-head { display: flex; align-items: center; gap: 2px; padding: 16px 12px 10px 20px; }
-  .sh-titles { margin-right: auto; min-width: 0; }
-  .sh-titles h2 { font-size: 19px; font-weight: 700; letter-spacing: -.024em; line-height: 1.2; }
+  .sh-head { display: flex; align-items: center; gap: 2px; min-height: 32px; padding: 14px 12px 0 16px; }
+  .sh-head .sp { flex: 1; }
+  .seg { display: inline-flex; padding: 2px; border-radius: 9px; background: var(--fill); }
+  .seg button { height: 26px; padding: 0 14px; border-radius: 7px; font-size: 12.5px; font-weight: 500; color: var(--text2); transition: background-color .2s, color .2s, box-shadow .2s; }
+  .seg button.on { background: var(--seg-on); color: var(--text); box-shadow: 0 1px 3px rgba(0,0,0,.12), 0 0 0 .5px rgba(0,0,0,.04); }
+  .back { display: inline-flex; align-items: center; gap: 1px; height: 32px; padding: 0 8px 0 0; margin-left: -6px; border-radius: 8px; color: var(--blue); font-size: 14px; font-weight: 500; }
+  .back svg { width: 20px; height: 20px; }
+  .back:hover span { text-decoration: underline; }
+  .sh-titles { padding: 10px 20px 10px; min-width: 0; }
+  .sh-titles h2 { font-size: 19px; font-weight: 700; letter-spacing: -.024em; line-height: 1.2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sh-titles p { font-size: 12px; color: var(--text2); margin-top: 1px; }
+  .pane { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  .pane.scroll { overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; padding: 2px 12px 14px; }
+  .pane.push { animation: push .4s var(--ease) both; }
+  .pane.pop { animation: pop .4s var(--ease) both; }
+  .pane.fade { animation: fadein .22s ease both; }
+  @keyframes push { from { opacity: 0; transform: translateX(32px); } }
+  @keyframes pop { from { opacity: 0; transform: translateX(-32px); } }
+  @keyframes fadein { from { opacity: 0; } }
   .sh-list { flex: 1; overflow-y: auto; overscroll-behavior: contain; padding: 4px 12px 14px; display: flex; flex-direction: column; gap: 10px; scrollbar-width: thin; }
+  .sh-cards { display: flex; flex-direction: column; gap: 10px; }
   .card { border-radius: 14px; padding: 8px; background: var(--card); box-shadow: 0 0 0 .5px var(--line), 0 1px 2px rgba(0,0,0,.04); animation: rise .35s var(--ease) both; }
   @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
   .card-shot { position: relative; border-radius: 9px; overflow: hidden; background: var(--fill); cursor: zoom-in; min-height: 60px; }
@@ -1735,6 +2035,32 @@
   .card-meta .mono { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1 1 auto; }
   .card-meta a { flex: none; max-width: 48%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text2); text-decoration: none; }
   .card-meta a:hover { color: var(--blue); }
+  .card-meta .where { flex: none; max-width: 48%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .card.ro { animation: none; }
+  .card-text { padding: 9px 6px 4px; font: 400 14px/1.42 ${FONT}; letter-spacing: -.008em; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+  /* History */
+  .grp + .grp { margin-top: 18px; }
+  .grp h3 { padding: 0 6px 6px; font-size: 12px; font-weight: 600; color: var(--text2); }
+  .grp-list { border-radius: 12px; overflow: hidden; background: var(--card); box-shadow: 0 0 0 .5px var(--line); }
+  .row {
+    position: relative; display: flex; align-items: center; gap: 12px; width: 100%; padding: 10px 10px 10px 14px; text-align: left;
+    transition: background-color .15s;
+  }
+  .row:hover { background: var(--fill); }
+  .row + .row::before { content: ''; position: absolute; left: 14px; right: 0; top: 0; border-top: .5px solid var(--line); }
+  .row-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .row-title { font-size: 13.5px; font-weight: 600; letter-spacing: -.01em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row-meta { font-size: 11.5px; color: var(--text2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row-prev { font-size: 12.5px; color: var(--text2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
+  .row-thumb { flex: none; width: 54px; height: 54px; border-radius: 8px; object-fit: cover; object-position: top center; background: var(--fill); box-shadow: 0 0 0 .5px var(--line); }
+  .row-thumb:not([src]) { visibility: hidden; }
+  .row-chev { flex: none; color: var(--text3); margin-left: -4px; }
+  .row-chev svg { width: 14px; height: 14px; }
+  .last { margin: 0 12px 12px; padding: 12px 12px 12px 14px; border-radius: 12px; background: var(--card); box-shadow: 0 0 0 .5px var(--line); }
+  .last-h { font-size: 11px; font-weight: 600; letter-spacing: .02em; text-transform: uppercase; color: var(--text3); margin-bottom: 4px; }
+  .last-row { display: flex; align-items: center; gap: 12px; }
+  .last-text { flex: 1; min-width: 0; }
   .sh-empty { flex: 1; display: grid; place-content: center; justify-items: center; gap: 14px; padding: 32px; text-align: center; color: var(--text2); line-height: 1.5; }
   .empty-ic { width: 56px; height: 56px; border-radius: 16px; display: grid; place-items: center; background: var(--fill); color: var(--text2); }
   .empty-ic svg { width: 26px; height: 26px; }

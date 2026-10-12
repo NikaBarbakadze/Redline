@@ -1,19 +1,30 @@
 // Redline — background service worker.
-// Owns the screenshots (IndexedDB), tab capture, the export to disk + Claude-ready
-// text, the toolbar badge and every entry point (icon, shortcut, context menu).
+// Owns the screenshots and session history (IndexedDB), tab capture, the export
+// to disk + Claude-ready text, the toolbar badge and every entry point (icon,
+// shortcut, context menu).
 
+// The active session lives in chrome.storage so every tab stays in sync. Copied
+// (or set-aside) sessions move to the `sessions` store: that's History.
 const SESSION_KEY = 'session';
+const HISTORY_LIMIT = 50;
 
 // ---------------------------------------------------------------------------
-// Screenshot store. Images live here, not in chrome.storage, so a capture in one
-// tab doesn't broadcast megabytes of base64 to every other tab's content script.
+// IndexedDB. Images live here, not in chrome.storage, so a capture in one tab
+// doesn't broadcast megabytes of base64 to every other tab's content script.
+//   images   item id → PNG data URL
+//   thumbs   item id → small JPEG data URL (History rows)
+//   sessions session id → archived session
 
 let dbPromise = null;
 
 function db() {
   dbPromise ??= new Promise((resolve, reject) => {
-    const req = indexedDB.open('redline', 1);
-    req.onupgradeneeded = () => req.result.createObjectStore('images');
+    const req = indexedDB.open('redline', 2);
+    req.onupgradeneeded = () => {
+      for (const name of ['images', 'thumbs', 'sessions']) {
+        if (!req.result.objectStoreNames.contains(name)) req.result.createObjectStore(name);
+      }
+    };
     req.onsuccess = () => {
       req.result.onclose = () => (dbPromise = null);
       resolve(req.result);
@@ -26,43 +37,148 @@ function db() {
   return dbPromise;
 }
 
-async function store(mode, fn) {
+async function run(name, mode, fn) {
   const conn = await db();
   return new Promise((resolve, reject) => {
-    const tx = conn.transaction('images', mode);
-    const out = fn(tx.objectStore('images'));
+    const tx = conn.transaction(name, mode);
+    const out = fn(tx.objectStore(name));
     tx.oncomplete = () => resolve(typeof out === 'function' ? out() : out?.result);
     tx.onerror = tx.onabort = () => reject(tx.error);
   });
 }
 
-const images = {
-  put: (id, dataUrl) => store('readwrite', (s) => s.put(dataUrl, id)),
-  keys: () => store('readonly', (s) => s.getAllKeys()),
-  remove: (ids) => store('readwrite', (s) => ids.forEach((id) => s.delete(id))),
-  getMany: (ids) =>
-    store('readonly', (s) => {
-      const found = {};
-      for (const id of ids) {
-        const req = s.get(id);
-        req.onsuccess = () => req.result && (found[id] = req.result);
-      }
-      return () => found;
-    }),
-};
+function keyValueStore(name) {
+  return {
+    put: (id, value) => run(name, 'readwrite', (s) => s.put(value, id)),
+    get: (id) => run(name, 'readonly', (s) => s.get(id)),
+    all: () => run(name, 'readonly', (s) => s.getAll()),
+    keys: () => run(name, 'readonly', (s) => s.getAllKeys()),
+    remove: (ids) => run(name, 'readwrite', (s) => ids.forEach((id) => s.delete(id))),
+    getMany: (ids) =>
+      run(name, 'readonly', (s) => {
+        const found = {};
+        for (const id of ids) {
+          const req = s.get(id);
+          req.onsuccess = () => req.result && (found[id] = req.result);
+        }
+        return () => found;
+      }),
+  };
+}
+
+const images = keyValueStore('images');
+const thumbs = keyValueStore('thumbs');
+const sessions = keyValueStore('sessions');
 
 async function getSession() {
   return (await chrome.storage.local.get(SESSION_KEY))[SESSION_KEY] ?? null;
 }
 
-// Drop screenshots that no longer belong to the session (after a clear, or a
-// delete whose undo window has passed).
+// Drop screenshots that belong to neither the active session nor History
+// (after an undo window has passed, or History was trimmed).
 async function collectGarbage() {
+  const live = [await getSession(), ...(await sessions.all())];
+  const keep = new Set(live.flatMap((s) => s?.items?.map((item) => item.id) ?? []));
+  const staleImages = (await images.keys()).filter((id) => !keep.has(id));
+  const staleThumbs = (await thumbs.keys()).filter((id) => !keep.has(id));
+  if (staleImages.length) await images.remove(staleImages);
+  if (staleThumbs.length) await thumbs.remove(staleThumbs);
+  return { removed: staleImages.length };
+}
+
+// ---------------------------------------------------------------------------
+// History
+
+// Moves the active session into History and leaves a fresh one behind.
+async function archive({ copied }) {
   const session = await getSession();
-  const keep = new Set(session?.items?.map((item) => item.id));
-  const stale = (await images.keys()).filter((id) => !keep.has(id));
-  if (stale.length) await images.remove(stale);
-  return { removed: stale.length };
+  await chrome.storage.local.remove(SESSION_KEY);
+  if (!session?.items?.length) return { id: null };
+  const now = Date.now();
+  await sessions.put(session.id, { ...session, archivedAt: now, copiedAt: copied ? now : (session.copiedAt ?? null) });
+  await trimHistory();
+  return { id: session.id, count: session.items.length };
+}
+
+// Makes a History session active again. Whatever was in progress is set aside
+// into History first, so nothing is lost.
+async function reopen(id) {
+  const entry = await sessions.get(id);
+  if (!entry) throw new Error('That session is no longer in History');
+  const active = await getSession();
+  if (active?.id !== id) await archive({ copied: false });
+  await sessions.remove([id]);
+  const { archivedAt, ...session } = entry;
+  await chrome.storage.local.set({ [SESSION_KEY]: session });
+  return { ok: true, count: session.items.length };
+}
+
+async function trimHistory() {
+  const all = (await sessions.all()).sort((a, b) => b.archivedAt - a.archivedAt);
+  const extra = all.slice(HISTORY_LIMIT).map((s) => s.id);
+  if (!extra.length) return;
+  await sessions.remove(extra);
+  await collectGarbage();
+}
+
+async function listHistory() {
+  const all = (await sessions.all()).sort((a, b) => b.archivedAt - a.archivedAt);
+  return { sessions: all.map(summarize) };
+}
+
+function summarize(s) {
+  const hosts = [...new Set(s.items.map((item) => hostOf(item.url)))];
+  return {
+    id: s.id,
+    archivedAt: s.archivedAt,
+    copiedAt: s.copiedAt ?? null,
+    count: s.items.length,
+    pages: new Set(s.items.map((item) => item.url)).size,
+    title: s.items[0]?.title || hosts[0] || 'Session',
+    host: hosts[0] ?? '',
+    preview: s.items[0]?.note ?? '',
+    thumbId: s.items[0]?.id ?? null,
+  };
+}
+
+function hostOf(url) {
+  try {
+    return new URL(url).host;
+  } catch {
+    return '';
+  }
+}
+
+// Small JPEGs for History rows, made once from the full screenshot.
+async function getThumbs(ids) {
+  const found = await thumbs.getMany(ids);
+  const missing = ids.filter((id) => !found[id]);
+  if (missing.length) {
+    const full = await images.getMany(missing);
+    for (const id of missing) {
+      if (!full[id]) continue;
+      try {
+        found[id] = await makeThumb(full[id]);
+        await thumbs.put(id, found[id]);
+      } catch {}
+    }
+  }
+  return found;
+}
+
+async function makeThumb(dataUrl) {
+  const bitmap = await createImageBitmap(await (await fetch(dataUrl)).blob());
+  const k = Math.min(1, 320 / Math.max(bitmap.width, bitmap.height));
+  const canvas = new OffscreenCanvas(Math.max(1, Math.round(bitmap.width * k)), Math.max(1, Math.round(bitmap.height * k)));
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingQuality = 'high';
+  ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+  const blob = await canvas.convertToBlob({ type: 'image/jpeg', quality: 0.82 });
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result);
+    reader.readAsDataURL(blob);
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -86,8 +202,9 @@ async function captureVisible(windowId) {
 // Export: write every screenshot to ~/Downloads/Redline/<session>/NN.png and
 // return a prompt that pairs each absolute path with its note.
 
-async function exportSession() {
-  const session = await getSession();
+// `id` exports a History session instead of the active one.
+async function exportSession(id = null) {
+  const session = id ? await sessions.get(id) : await getSession();
   if (!session?.items?.length) throw new Error('No notes to copy yet');
 
   const stored = await images.getMany(session.items.map((item) => item.id));
@@ -100,6 +217,10 @@ async function exportSession() {
         stored[item.id] ? saveFile(stored[item.id], `${folder}/${pad(i + 1)}.png`) : null,
       ),
     );
+    if (id) {
+      const now = Date.now();
+      await sessions.put(id, { ...session, copiedAt: now, archivedAt: now }); // back to the top of History
+    }
     return { text: buildPrompt(session, paths), count: session.items.length };
   } finally {
     await setDownloadUi(true);
@@ -266,7 +387,14 @@ const handlers = {
     return { ok: true };
   },
   gc: () => collectGarbage(),
-  export: () => exportSession(),
+  export: ({ id }) => exportSession(id),
+  archive: ({ copied }) => archive({ copied: !!copied }),
+  reopen: ({ id }) => reopen(id),
+  history: () => listHistory(),
+  historyGet: async ({ id }) => ({ session: (await sessions.get(id)) ?? null }),
+  historyDelete: async ({ id }) => (await sessions.remove([id]), { ok: true }),
+  historyRestore: async ({ session }) => (await sessions.put(session.id, session), { ok: true }),
+  thumbs: ({ ids }) => getThumbs(ids),
   copyText: async ({ text }) => (await copyText(text), { ok: true }),
   shortcut: async () => ({ shortcut: await shortcut() }),
   openShortcuts: () => chrome.tabs.create({ url: 'chrome://extensions/shortcuts' }).then(() => ({ ok: true })),
@@ -296,17 +424,19 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   switch (info.menuItemId) {
     case 'review':
       return tellTab(tab, { type: 'review' });
+    case 'history':
+      return tellTab(tab, { type: 'history' });
     case 'copy':
       if (await tellTab(tab, { type: 'copy' })) return;
       // No page UI available: copy straight from here.
       try {
         await copyText((await exportSession()).text);
+        await archive({ copied: true });
       } catch {}
       return;
     case 'clear':
       if (await tellTab(tab, { type: 'clear' })) return;
-      await chrome.storage.local.remove(SESSION_KEY);
-      return collectGarbage();
+      return archive({ copied: false });
     case 'shortcuts':
       return chrome.tabs.create({ url: 'chrome://extensions/shortcuts' });
   }
@@ -320,6 +450,7 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
   chrome.contextMenus.removeAll(() => {
     const menu = [
       ['review', 'Review notes'],
+      ['history', 'History'],
       ['copy', 'Copy notes for Claude'],
       ['clear', 'Start a new session'],
       ['shortcuts', 'Change keyboard shortcut…'],
