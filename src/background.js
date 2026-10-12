@@ -207,27 +207,98 @@ async function captureVisible(windowId) {
 
 // `id` exports a History session instead of the active one.
 async function exportSession(id = null) {
-  const session = id ? await sessions.get(id) : await getSession();
+  const session = await sessionById(id);
   if (!session?.items?.length) throw new Error('No notes to copy yet');
 
+  const { paths } = await saveSessionFiles(session);
+  if (id && (await sessions.get(id))) {
+    const now = Date.now();
+    await sessions.put(id, { ...session, copiedAt: now, archivedAt: now }); // back to the top of History
+  }
+  const text = buildPrompt(session, paths);
+  // Pasting this exact text into a web chat brings the screenshots along (see
+  // the content script's paste handler); remember which copy it was.
+  await chrome.storage.local.set({ lastCopy: { id: session.id, hash: textHash(text), at: Date.now() } });
+  pasteBundle(session.id).catch(() => {}); // warm it up so the paste is instant
+  return { text, count: session.items.length };
+}
+
+// Active session, or one from History.
+async function sessionById(id) {
+  const active = await getSession();
+  if (!id || active?.id === id) return active;
+  return (await sessions.get(id)) ?? null;
+}
+
+// Writes ~/Downloads/Redline/<session>/NN.png. `keepFirst` leaves the first
+// file's downloads row in place so it can be revealed in Finder.
+async function saveSessionFiles(session, { keepFirst = false } = {}) {
   const stored = await images.getMany(session.items.map((item) => item.id));
   const folder = `Redline/${session.folder}`;
-
   await setDownloadUi(false);
   try {
-    const paths = await Promise.all(
+    const saved = await Promise.all(
       session.items.map((item, i) =>
-        stored[item.id] ? saveFile(stored[item.id], `${folder}/${pad(i + 1)}.png`) : null,
+        stored[item.id] ? saveFile(stored[item.id], `${folder}/${pad(i + 1)}.png`, keepFirst && i === 0) : null,
       ),
     );
-    if (id) {
-      const now = Date.now();
-      await sessions.put(id, { ...session, copiedAt: now, archivedAt: now }); // back to the top of History
-    }
-    return { text: buildPrompt(session, paths), count: session.items.length };
+    return { paths: saved.map((f) => f?.path ?? null), firstId: saved[0]?.downloadId ?? null };
   } finally {
     await setDownloadUi(true);
   }
+}
+
+// "Show files": open the session's folder in Finder with screenshot 1 selected,
+// for dragging the images into desktop apps.
+async function revealFiles(id) {
+  const session = await sessionById(id);
+  if (!session?.items?.length) throw new Error('No screenshots to show');
+  const { firstId } = await saveSessionFiles(session, { keepFirst: true });
+  if (firstId == null) throw new Error('No screenshots to show');
+  chrome.downloads.show(firstId);
+  setTimeout(() => chrome.downloads.erase({ id: firstId }).catch(() => {}), 3000);
+  return { ok: true };
+}
+
+// Same on both sides (content.js has a copy): identifies Redline's text on the
+// clipboard whatever the line endings.
+function textHash(text) {
+  const s = text.replace(/\r\n?/g, '\n').trim();
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return `${s.length}:${(h >>> 0).toString(36)}`;
+}
+
+// What a web-chat paste attaches: every screenshot numbered in its corner, and
+// the prompt worded for attachments instead of file paths.
+let bundleCache = null;
+async function pasteBundle(id) {
+  const session = await sessionById(id);
+  if (!session?.items?.length) throw new Error('Those notes are no longer in Redline');
+  const key = [session.id, ...session.items.map((item) => `${item.id}:${item.note}`)].join('|');
+  if (bundleCache?.key !== key) {
+    const value = (async () => {
+      const stored = await images.getMany(session.items.map((item) => item.id));
+      const files = await Promise.all(
+        session.items.map(async (item, i) =>
+          stored[item.id] ? { name: `redline-${pad(i + 1)}.png`, dataUrl: await numberImage(stored[item.id], i + 1) } : null,
+        ),
+      );
+      return { files: files.filter(Boolean), text: buildPrompt(session, null) };
+    })();
+    bundleCache = { key, value };
+    value.catch(() => bundleCache?.value === value && (bundleCache = null));
+  }
+  return bundleCache.value;
+}
+
+async function numberedImage(itemId, n) {
+  const { [itemId]: dataUrl } = await images.getMany([itemId]);
+  if (!dataUrl) throw new Error('That screenshot is missing');
+  return { dataUrl: await numberImage(dataUrl, n) };
 }
 
 async function setDownloadUi(enabled) {
@@ -238,11 +309,11 @@ async function setDownloadUi(enabled) {
   }
 }
 
-async function saveFile(url, filename) {
+async function saveFile(url, filename, keepRow = false) {
   const id = await chrome.downloads.download({ url, filename, conflictAction: 'overwrite', saveAs: false });
   const item = await downloadFinished(id);
-  chrome.downloads.erase({ id }).catch(() => {}); // keep the file, drop the history row
-  return item.filename;
+  if (!keepRow) chrome.downloads.erase({ id }).catch(() => {}); // keep the file, drop the history row
+  return { path: item.filename, downloadId: id };
 }
 
 function downloadFinished(id) {
@@ -317,59 +388,6 @@ function describeTarget(item) {
 }
 
 // ---------------------------------------------------------------------------
-// Send to claude.ai: open a new chat and hand Redline's content script there the
-// numbered screenshots and the prompt. It attaches them and fills in the text;
-// you review and press send. The session is filed into History like a copy.
-
-const CHAT_URL = 'https://claude.ai/new';
-
-async function sendToChat(id, opener) {
-  const session = id ? await sessions.get(id) : await getSession();
-  if (!session?.items?.length) throw new Error('No notes to send yet');
-
-  const stored = await images.getMany(session.items.map((item) => item.id));
-  const files = (
-    await Promise.all(
-      session.items.map(async (item, i) =>
-        stored[item.id] ? { name: `redline-${pad(i + 1)}.png`, dataUrl: await numberImage(stored[item.id], i + 1) } : null,
-      ),
-    )
-  ).filter(Boolean);
-  const text = buildPrompt(session, null);
-
-  const tab = await chrome.tabs.create({
-    url: CHAT_URL,
-    ...(opener ? { openerTabId: opener.id, index: opener.index + 1, windowId: opener.windowId } : {}),
-  });
-  await fillChat(tab.id, { files, text });
-
-  if (id) {
-    const now = Date.now();
-    await sessions.put(id, { ...session, copiedAt: now, archivedAt: now });
-  } else {
-    await archive({ copied: true });
-  }
-  return { ok: true, count: session.items.length };
-}
-
-// The tab is still loading; keep asking until Redline is up in it and reports
-// back (it waits for the chat box itself).
-async function fillChat(tabId, payload) {
-  const deadline = Date.now() + 30000;
-  for (;;) {
-    let res;
-    try {
-      res = await chrome.tabs.sendMessage(tabId, { ...payload, type: 'chatFill', target: 'page' }, { frameId: 0 });
-    } catch {
-      if (Date.now() > deadline) throw new Error('claude.ai took too long to open');
-      await sleep(300);
-      continue;
-    }
-    if (res?.ok) return res;
-    throw new Error(res?.error ?? 'Couldn’t fill in the chat');
-  }
-}
-
 // The note's number in the screenshot's corner, so each image maps to its note
 // even if the chat reorders attachments.
 async function numberImage(dataUrl, n) {
@@ -478,7 +496,9 @@ const handlers = {
   },
   gc: () => collectGarbage(),
   export: ({ id }) => exportSession(id),
-  sendToChat: ({ id }, sender) => sendToChat(id, sender.tab),
+  pasteBundle: ({ id }) => pasteBundle(id),
+  numberedImage: ({ itemId, n }) => numberedImage(itemId, n),
+  revealFiles: ({ id }) => revealFiles(id),
   archive: ({ copied }) => archive({ copied: !!copied }),
   reopen: ({ id }) => reopen(id),
   history: () => listHistory(),
@@ -521,7 +541,6 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
       if (await tellTab(tab, { type: 'copy' })) return;
       // No page UI available: do it from here.
       try {
-        if ((await chrome.storage.local.get('target')).target === 'chat') return await sendToChat(null, tab);
         await copyText((await exportSession()).text);
         await archive({ copied: true });
       } catch {}
@@ -543,7 +562,7 @@ chrome.runtime.onInstalled.addListener(({ reason }) => {
     const menu = [
       ['review', 'Review notes'],
       ['history', 'History'],
-      ['copy', 'Copy / send notes to Claude'],
+      ['copy', 'Copy notes'],
       ['clear', 'Start a new session'],
       ['shortcuts', 'Change keyboard shortcut…'],
     ];

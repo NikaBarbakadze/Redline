@@ -34,7 +34,7 @@ The welcome page that opens shows your shortcut and has a card to practice on.
 - Hover states stay live while picking, so open menus, tooltips and modals (including native `<dialog>`s) can be captured.
 - Works inside iframes, including cross-origin ones like an embedded app in Shopify admin or the theme editor preview. The note records the iframe's URL (path only, so session tokens stay out) and the element path inside it.
 - Red numbered pins mark what you've already covered. Hover one to read the note, click it to edit.
-- The dock in the corner shows the count and has **Copy for Claude**. Click the count to review: edit notes inline, zoom screenshots, delete (with undo).
+- The dock in the corner shows the count and has **Copy notes**. Click the count to review: edit notes inline, zoom screenshots, delete (with undo).
 - A session spans tabs and pages. **Copying closes it**: it moves to History and your next note starts again at 1, so a forgotten "new session" can't mix batches. Copied too early? **Keep adding** in the toast reopens it.
 - **History** (the second tab in the panel, or right-click the icon → History) keeps your last 50 sessions. Open one to see its notes and screenshots, copy it again (same file paths), or **Continue** it to add more notes. Anything in progress is set aside into History first, so nothing is lost.
 
@@ -69,16 +69,18 @@ Element screenshots include some surrounding context with the target outlined in
 
 The format is built for **Claude Code**, which opens the screenshots from those paths. Page, viewport and element details are only repeated per note when they differ.
 
-### Sending to claude.ai instead
+### Where to paste
 
-claude.ai can't open files on your computer, and the clipboard holds only one image, so the path-based copy doesn't work there. Switch **Paste into** (bottom of the panel) to **claude.ai** and the button becomes **Open in claude.ai**: it opens a new chat with every screenshot attached at full quality, each stamped with its note number, and the notes typed into the message box. Review it and press send. The session goes to History, same as a copy. The choice is remembered.
+- **Claude Code, Codex (CLI or app), Cursor and other coding agents:** paste as is. They open the screenshots from the paths.
+- **Any web chat** (claude.ai, including project chats and existing conversations, ChatGPT, Codex on the web…): <kbd>⌘</kbd><kbd>V</kbd> attaches every screenshot, numbered in its corner, and swaps the paths for "attached image N". Redline recognises its own text on the clipboard, so ordinary pastes are untouched. **Paste and Match Style** (<kbd>⌥</kbd><kbd>⇧</kbd><kbd>⌘</kbd><kbd>V</kbd>) pastes just the text, and so does any page that doesn't take images.
+- **Desktop chat apps** (Claude, ChatGPT): **Show files** in the "Copied" toast opens the screenshots in Finder to drag in, or copy a single screenshot from its card in the panel.
 
 ## How it works
 
 No build step and no dependencies.
 
 - `src/content.js`: all in-page UI (picker, composer, pins, dock, review sheet) in a shadow root. It runs in every frame. Child frames pick on their own and post the result to their parent, which offsets it by the `<iframe>`'s content box and passes it up until the top frame takes the screenshot and opens the composer. Keys follow the pointer between frames. The host is a manual popover so it sits in the top layer above the page's own modals. When a modal `<dialog>` is open, it moves inside the dialog so it isn't inert. Idle cost on a page is one storage read and a pointer listener.
-- `src/background.js`: captures the tab, keeps screenshots, thumbnails and session History in IndexedDB (only the active session lives in `chrome.storage`, so tabs stay in sync without passing megabytes of base64 around), writes the PNGs with the download bubble suppressed and the downloads list cleaned up, and builds the prompt.
+- `src/background.js`: captures the tab, builds the numbered attachments for web-chat pastes, keeps screenshots, thumbnails and session History in IndexedDB (only the active session lives in `chrome.storage`, so tabs stay in sync without passing megabytes of base64 around), writes the PNGs with the download bubble suppressed and the downloads list cleaned up, and builds the prompt.
 - `src/offscreen.*`: clipboard fallback for when the page can't write it.
 
 Nothing leaves your machine.

@@ -26,7 +26,8 @@
   let history = null; // History summaries, newest first (loaded when the sheet opens)
   let entry = null; // the archived session open in the sheet
   let uiHidden = false; // Esc tucked the dock and pins away (all tabs) until the next capture
-  let target = 'code'; // where notes go: 'code' (copy, Claude Code reads the files) or 'chat' (claude.ai)
+  let lastCopy = null; // { id, hash, at }: the last text Redline copied (see onPaste)
+  let plainNext = 0; // ⇧⌘V was pressed: leave the next paste alone until this time
   let shortcutLabel = isMac ? '⌘⇧S' : 'Ctrl+Shift+S';
   let myTabId = null;
   const pointer = { x: -1, y: -1 };
@@ -74,10 +75,10 @@
   }
 
   function onStorage(changes, area) {
-    if (area !== 'local' || !(KEY in changes || 'uiHidden' in changes || 'target' in changes)) return;
+    if ('lastCopy' in changes && area === 'local') lastCopy = changes.lastCopy.newValue ?? null;
+    if (area !== 'local' || !(KEY in changes || 'uiHidden' in changes)) return;
     if (KEY in changes) session = changes[KEY].newValue ?? null;
     if ('uiHidden' in changes) uiHidden = !!changes.uiHidden.newValue;
-    if ('target' in changes) target = changes.target.newValue === 'chat' ? 'chat' : 'code';
     render();
   }
 
@@ -306,7 +307,7 @@
     close: () => closeSheet(),
     copy: (e) => copyAll(e.target.closest('button')),
     copyEntry: (e) => copyAll(e.target.closest('button'), entry?.id),
-    target: (e) => setTarget(e.target.closest('[data-target]').dataset.target),
+    copyImage: (e) => copyImage(e.target.closest('.card')),
     clear: () => clearSession(),
     view: (e) => setSheetView(e.target.closest('[data-view]').dataset.view),
     back: () => setSheetView('history'),
@@ -327,7 +328,7 @@
       if (item.frameUrl) toFrames({ type: 'frame:show', id });
       else showItem(item);
     },
-    toast: () => toastAction?.(),
+    toast: (e) => toastActions[Number(e.target.closest('[data-i]')?.dataset.i ?? 0)]?.(),
   };
 
   // -------------------------------------------------------------------------
@@ -968,7 +969,6 @@
   async function copyAll(button, historyId = null) {
     const count = historyId ? (entry?.items.length ?? 0) : (session?.items.length ?? 0);
     if (!count) return toast('Nothing to copy yet');
-    if (target === 'chat') return sendToChat(button, historyId);
     button?.classList.add('busy');
     try {
       const { text } = await send({ type: 'export', id: historyId });
@@ -981,16 +981,16 @@
         b.classList.add('done');
         setTimeout(() => b.classList.remove('done'), 1600);
       }
+      const showFiles = (id) => ({ label: 'Show files', run: () => revealFiles(id) });
       if (historyId) {
         if (entry?.id === historyId) entry.copiedAt = entry.archivedAt = Date.now();
-        toast(`Copied ${plural(count, 'note')}. Paste into Claude.`, { ok: true });
+        toast(`Copied ${plural(count, 'note')}`, { ok: true, actions: [showFiles(historyId)] });
       } else {
         const { id } = await send({ type: 'archive', copied: true });
         await syncSession();
-        toast(`Copied ${plural(count, 'note')}. Paste into Claude.`, {
+        toast(`Copied ${plural(count, 'note')}`, {
           ok: true,
-          action: 'Keep adding',
-          onAction: () => reopenSession(id, { quiet: true }),
+          actions: [showFiles(id), { label: 'Keep adding', run: () => reopenSession(id, { quiet: true }) }],
         });
       }
       refreshHistory();
@@ -1001,47 +1001,90 @@
     }
   }
 
-  // claude.ai can't open files on your Mac, so the screenshots travel as
-  // attachments: the worker opens a new chat and Redline there fills it in.
-  async function sendToChat(button, historyId) {
-    button?.classList.add('busy');
+  // Opens the session's folder in Finder, for dragging the screenshots into a
+  // desktop app.
+  function revealFiles(id) {
+    send({ type: 'revealFiles', id }).catch((err) => toast(`Couldn’t show the files: ${err.message}`, { error: true }));
+  }
+
+  // One screenshot (numbered) onto the clipboard, for pasting a single image.
+  async function copyImage(card) {
+    const n = Number(card.querySelector('.num').textContent);
     try {
-      await send({ type: 'sendToChat', id: historyId });
-      if (historyId && entry?.id === historyId) entry.copiedAt = entry.archivedAt = Date.now();
-      await syncSession();
-      refreshHistory();
+      const { dataUrl } = await send({ type: 'numberedImage', itemId: card.dataset.id, n });
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': dataUrlToBlob(dataUrl) })]);
+      toast(`Copied screenshot ${n}`, { ok: true });
     } catch (err) {
-      toast(`Couldn’t open claude.ai: ${err.message}`, { error: true });
-    } finally {
-      button?.classList.remove('busy');
+      toast(`Couldn’t copy the screenshot: ${err.message}`, { error: true });
     }
   }
 
-  // In the new claude.ai tab: attach the screenshots and type the prompt.
-  async function fillChat({ files, text }) {
-    const find = () => ({
-      input: document.querySelector('input[data-testid="file-upload"]') ?? document.querySelector('input[type="file"][multiple]'),
-      editor:
-        document.querySelector('[data-testid="chat-input"]') ??
-        document.querySelector('.ProseMirror[contenteditable="true"], div[contenteditable="true"]'),
-    });
-    let el = find();
-    for (let i = 0; (!el.input || !el.editor) && i < 100; i++) {
-      await new Promise((r) => setTimeout(r, 150));
-      el = find();
+  // -------------------------------------------------------------------------
+  // Paste anywhere. Copy puts text with file paths on the clipboard, which
+  // coding agents (Claude Code, Codex) read as is. Pasting that same text into a
+  // message box on a web page (a claude.ai project chat, ChatGPT, Codex on the
+  // web…) brings the screenshots along: Redline swaps the paste for the
+  // numbered images plus the notes worded for attachments. Paste and Match
+  // Style (⌥⇧⌘V) pastes just the text; so does a page that takes no images.
+
+  function onPaste(e) {
+    if (!e.isTrusted || !lastCopy || Date.now() - lastCopy.at > 12 * 3600e3 || ours(e)) return;
+    if (Date.now() < plainNext) return void (plainNext = 0);
+    const field = e.composedPath()[0];
+    if (!(field?.tagName === 'TEXTAREA' || field?.isContentEditable)) return; // single-line inputs keep plain text
+    const text = e.clipboardData?.getData('text/plain');
+    if (!text || textHash(text) !== lastCopy.hash) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    pasteInto(field, lastCopy.id, text);
+  }
+
+  async function pasteInto(field, id, plainText) {
+    let bundle;
+    try {
+      bundle = await send({ type: 'pasteBundle', id });
+    } catch (err) {
+      insertText(field, plainText);
+      return toast(`Pasted the text only: ${err.message}`, { error: true });
     }
-    if (!el.input || !el.editor) {
-      toast('Couldn’t find the chat box. Are you logged in to claude.ai?', { error: true });
-      return { ok: false, error: 'couldn’t find the chat box (are you logged in?)' };
+    const files = bundle.files.map((f) => new File([dataUrlToBlob(f.dataUrl)], f.name, { type: 'image/png' }));
+    field.focus();
+    // Chat apps take pasted images; the ones that don't usually have an upload input.
+    const taken = !field.dispatchEvent(
+      new ClipboardEvent('paste', { clipboardData: transfer(files), bubbles: true, cancelable: true, composed: true }),
+    );
+    const attached = taken || attachViaInput(field, files);
+    insertText(field, attached ? bundle.text : plainText);
+    if (attached) toast(`Attached ${plural(files.length, 'screenshot')} with your notes`, { ok: true });
+    else toast('This page doesn’t take images, so only the text was pasted', { actions: [{ label: 'Show files', run: () => revealFiles(id) }] });
+  }
+
+  function transfer(files) {
+    const dt = new DataTransfer();
+    for (const f of files) dt.items.add(f);
+    return dt;
+  }
+
+  // The message box's own upload input: within its form, or a few levels up.
+  function attachViaInput(field, files) {
+    let input = field.closest('form')?.querySelector('input[type="file"]') ?? null;
+    for (let n = field.parentElement, i = 0; !input && n && i < 6; n = n.parentElement, i++) {
+      input = n.querySelector('input[type="file"]');
     }
-    const attach = new DataTransfer();
-    for (const f of files) attach.items.add(new File([dataUrlToBlob(f.dataUrl)], f.name, { type: 'image/png' }));
-    el.input.files = attach.files;
-    el.input.dispatchEvent(new Event('change', { bubbles: true }));
-    el.editor.focus();
-    document.execCommand('insertText', false, text);
-    toast(`Added ${plural(files.length, 'screenshot')} and your notes. Review, then send.`, { ok: true });
-    return { ok: true };
+    if (!input) return false;
+    input.files = transfer(input.multiple ? files : files.slice(0, 1)).files;
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  }
+
+  function insertText(field, text) {
+    field.focus();
+    if (document.execCommand('insertText', false, text)) return;
+    if (field.tagName === 'TEXTAREA') {
+      const { selectionStart: a, selectionEnd: b, value } = field;
+      field.value = value.slice(0, a) + text + value.slice(b);
+      field.dispatchEvent(new Event('input', { bubbles: true }));
+    }
   }
 
   function dataUrlToBlob(dataUrl) {
@@ -1052,29 +1095,16 @@
     return new Blob([buf], { type: head.match(/data:([^;]+)/)?.[1] ?? 'image/png' });
   }
 
-  function setTarget(value) {
-    target = value === 'chat' ? 'chat' : 'code';
-    render();
-    chrome.storage.local.set({ target }).catch(() => {});
-  }
-
-  // Primary buttons and the switch follow the chosen destination.
-  function renderTarget() {
-    const chat = target === 'chat';
-    for (const b of root.querySelectorAll('[data-act="copy"], [data-act="copyEntry"]')) {
-      b.querySelector('.lbl').textContent = chat ? 'Open in claude.ai' : 'Copy for Claude';
-      b.querySelector('.ic:not(.ok)').innerHTML = chat ? ICON.open : ICON.copy;
-      b.title = chat
-        ? 'Open a new claude.ai chat with the screenshots attached and the notes filled in'
-        : 'Save screenshots and copy everything for Claude Code';
+  // Same on both sides (background.js has a copy): identifies Redline's text on
+  // the clipboard whatever the line endings.
+  function textHash(text) {
+    const s = text.replace(/\r\n?/g, '\n').trim();
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
     }
-    for (const b of $.dest.querySelectorAll('[data-target]')) {
-      b.classList.toggle('on', b.dataset.target === target);
-      b.setAttribute('aria-selected', b.dataset.target === target);
-    }
-    $.shNote.textContent = chat
-      ? 'Opens claude.ai with the screenshots attached; you press send.'
-      : 'Screenshots are saved to Downloads/Redline and linked in the text.';
+    return `${s.length}:${(h >>> 0).toString(36)}`;
   }
 
   // Sets the current notes aside (into History) without copying them.
@@ -1170,6 +1200,8 @@
 
   function onKeyDown(e) {
     if (e.key === 'Escape') escDown = true;
+    // ⌥⇧⌘V (Paste and Match Style) or Ctrl+Shift+V: paste plain text, no screenshots.
+    if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.code === 'KeyV') plainNext = Date.now() + 1500;
     routeKey(e, false);
   }
 
@@ -1391,7 +1423,9 @@
           card.className = 'card ro';
           card.dataset.id = item.id;
           card.innerHTML = `
-            <div class="card-shot" data-act="zoom"><img alt=""><span class="num"></span></div>
+            <div class="card-shot" data-act="zoom"><img alt=""><span class="num"></span>
+              <span class="card-acts"><button class="card-act" data-act="copyImage" title="Copy this screenshot">${ICON.copy}</button></span>
+            </div>
             <p class="card-text"></p>
             <div class="card-meta"><span class="mono"></span><span class="where"></span></div>`;
           card.querySelector('.num').textContent = i + 1;
@@ -1473,7 +1507,10 @@
       <div class="card-shot" data-act="zoom">
         <img alt="">
         <span class="num"></span>
-        <button class="card-del" data-act="remove" title="Delete note">${ICON.trash}</button>
+        <span class="card-acts">
+          <button class="card-act" data-act="copyImage" title="Copy this screenshot">${ICON.copy}</button>
+          <button class="card-act del" data-act="remove" title="Delete note">${ICON.trash}</button>
+        </span>
       </div>
       <textarea class="card-note" rows="1" spellcheck="true" placeholder="What should change?"></textarea>
       <div class="card-meta">
@@ -1517,10 +1554,11 @@
   // Toasts
 
   let toastTimer = 0;
-  let toastAction = null;
+  let toastActions = [];
   let toastExpire = null;
 
-  function toast(text, { action, onAction, onExpire, ok, error } = {}) {
+  // `actions: [{ label, run }]`; `action` + `onAction` is the one-button form.
+  function toast(text, { action, onAction, actions = action ? [{ label: action, run: onAction }] : [], onExpire, ok, error } = {}) {
     ensureUI();
     clearTimeout(toastTimer);
     toastExpire?.();
@@ -1528,18 +1566,22 @@
     $.toastIcon.innerHTML = ok ? ICON.check : error ? ICON.warn : '';
     $.toastIcon.hidden = !(ok || error);
     $.toast.classList.toggle('error', !!error);
-    $.toastBtn.hidden = !action;
-    $.toastBtn.textContent = action ?? '';
+    $.toastActs.replaceChildren(
+      ...actions.map(({ label }, i) => {
+        const b = document.createElement('button');
+        b.textContent = label;
+        Object.assign(b.dataset, { act: 'toast', i });
+        return b;
+      }),
+    );
     toastExpire = onExpire ?? null;
-    toastAction = onAction
-      ? () => {
-          toastExpire = null;
-          hideToast();
-          onAction();
-        }
-      : null;
+    toastActions = actions.map(({ run }) => () => {
+      toastExpire = null;
+      hideToast();
+      run();
+    });
     $.toast.classList.add('on');
-    toastTimer = setTimeout(hideToast, action ? 6000 : 3200);
+    toastTimer = setTimeout(hideToast, actions.length ? 6000 : 3200);
   }
 
   function hideToast() {
@@ -1561,7 +1603,6 @@
       $.dock.classList.toggle('on', showDock);
       $.dockCount.textContent = items.length;
       $.dockLabel.textContent = items.length === 1 ? 'note' : 'notes';
-      renderTarget();
       if (sheetOpen) renderSheet();
     }
     renderPins();
@@ -1812,11 +1853,6 @@
   function onMessage(msg, _sender, sendResponse) {
     if (msg?.target !== 'page') return false;
     if (IS_EXTENSION_PAGE && msg.tabId != null && myTabId != null && msg.tabId !== myTabId) return false;
-    if (msg.type === 'chatFill') {
-      if (!IS_TOP) return false;
-      domReady.then(() => fillChat(msg)).then(sendResponse, (err) => sendResponse({ ok: false, error: String(err?.message ?? err) }));
-      return true;
-    }
     if (msg.type?.startsWith('frame:')) {
       if (IS_TOP) return false;
       onFrameCommand(msg);
@@ -1863,6 +1899,7 @@
 
   on(window, 'keydown', onKeyDown, { capture: true });
   on(window, 'keyup', onKeyUp, { capture: true });
+  on(window, 'paste', onPaste, { capture: true });
   on(window, 'keydown', idleEscape);
   on(window, 'pointermove', (e) => ((pointer.x = e.clientX), (pointer.y = e.clientY)), { passive: true, capture: true });
   on(window, 'pointerout', (e) => !e.relatedTarget && (pointer.x = pointer.y = -1), { passive: true, capture: true });
@@ -1890,10 +1927,10 @@
   const domReady = new Promise((resolve) =>
     document.readyState === 'loading' ? on(document, 'DOMContentLoaded', resolve, { once: true }) : resolve(),
   );
-  Promise.all([chrome.storage.local.get([KEY, 'uiHidden', 'target']), domReady]).then(([stored]) => {
+  chrome.storage.local.get('lastCopy').then((stored) => (lastCopy = stored.lastCopy ?? null));
+  Promise.all([chrome.storage.local.get([KEY, 'uiHidden']), domReady]).then(([stored]) => {
     session = stored[KEY] ?? null;
     uiHidden = !!stored.uiHidden;
-    target = stored.target === 'chat' ? 'chat' : 'code';
     pingChildren();
     render();
   });
@@ -1965,8 +2002,8 @@
         <span class="num" data-ref="dockCount">0</span><span data-ref="dockLabel">notes</span>
       </button>
       <button class="icon-btn" data-act="capture" data-ref="dockCapture" title="Capture">${ICON.capture}</button>
-      <button class="btn primary pill" data-act="copy" title="Save screenshots and copy everything for Claude">
-        <span class="ic">${ICON.copy}</span><span class="ic ok">${ICON.check}</span>${SPINNER}<span class="lbl">Copy for Claude</span>
+      <button class="btn primary pill" data-act="copy" title="Copy the notes. Paste into Claude Code or Codex as is; in a web chat the screenshots come along">
+        <span class="ic">${ICON.copy}</span><span class="ic ok">${ICON.check}</span>${SPINNER}<span class="lbl">Copy notes</span>
       </button>
     </div>
 
@@ -2013,26 +2050,19 @@
       </div>
 
       <div class="sh-bottom" data-ref="bottom">
-      <div class="dest" data-ref="dest">
-        <span>Paste into</span>
-        <div class="seg sm" role="tablist">
-          <button data-act="target" data-target="code" role="tab">Claude Code</button>
-          <button data-act="target" data-target="chat" role="tab">claude.ai</button>
-        </div>
-      </div>
       <footer class="sh-foot" data-ref="footCurrent">
         <button class="btn ghost" data-act="clear" title="Move these notes to History and start fresh">New session</button>
         <button class="btn primary" data-act="copy">
-          <span class="ic">${ICON.copy}</span><span class="ic ok">${ICON.check}</span>${SPINNER}<span class="lbl">Copy for Claude</span>
+          <span class="ic">${ICON.copy}</span><span class="ic ok">${ICON.check}</span>${SPINNER}<span class="lbl">Copy notes</span>
         </button>
       </footer>
       <footer class="sh-foot" data-ref="footEntry" hidden>
         <button class="btn ghost" data-act="reopen" title="Make it the current session and add more notes">Continue</button>
         <button class="btn primary" data-act="copyEntry">
-          <span class="ic">${ICON.copy}</span><span class="ic ok">${ICON.check}</span>${SPINNER}<span class="lbl">Copy for Claude</span>
+          <span class="ic">${ICON.copy}</span><span class="ic ok">${ICON.check}</span>${SPINNER}<span class="lbl">Copy notes</span>
         </button>
       </footer>
-      <p class="sh-note" data-ref="shNote">Screenshots are saved to Downloads/Redline and linked in the text.</p>
+      <p class="sh-note" data-ref="shNote">Paste into Claude Code or Codex as is. In a web chat, ${isMac ? '⌘V' : 'Ctrl+V'} attaches the screenshots too.</p>
       </div>
     </aside>
 
@@ -2041,7 +2071,7 @@
     <div class="toast glass" data-ref="toast" role="status">
       <span class="t-ic" data-ref="toastIcon" hidden></span>
       <span data-ref="toastText"></span>
-      <button data-act="toast" data-ref="toastBtn" hidden></button>
+      <span class="t-acts" data-ref="toastActs"></span>
     </div>
   </div>`;
 
@@ -2241,13 +2271,14 @@
   .card-shot img { display: block; width: 100%; max-height: 210px; object-fit: contain; }
   .card-shot img:not([src]) { visibility: hidden; height: 120px; }
   .card-shot .num { position: absolute; left: 8px; top: 8px; box-shadow: 0 1px 4px rgba(0,0,0,.25); }
-  .card-del {
-    position: absolute; right: 6px; top: 6px; width: 28px; height: 28px; border-radius: 14px; display: grid; place-items: center;
-    color: #fff; background: rgba(0,0,0,.5); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
-    opacity: 0; transition: opacity .15s, background-color .15s;
+  .card-acts { position: absolute; right: 6px; top: 6px; display: flex; gap: 6px; opacity: 0; transition: opacity .15s; }
+  .card:hover .card-acts, .card-acts:focus-within { opacity: 1; }
+  .card-act {
+    width: 28px; height: 28px; border-radius: 14px; display: grid; place-items: center;
+    color: #fff; background: rgba(0,0,0,.5); -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px); transition: background-color .15s;
   }
-  .card:hover .card-del, .card-del:focus-visible { opacity: 1; }
-  .card-del:hover { background: var(--red); }
+  .card-act:hover { background: rgba(0,0,0,.7); }
+  .card-act.del:hover { background: var(--red); }
   .card-note {
     display: block; width: 100%; min-height: 30px; max-height: 240px; field-sizing: content; resize: none; border: 0; outline: 0;
     background: transparent; color: var(--text); caret-color: var(--blue); padding: 9px 6px 4px; border-radius: 6px;
@@ -2288,9 +2319,6 @@
   .empty-ic { width: 56px; height: 56px; border-radius: 16px; display: grid; place-items: center; background: var(--fill); color: var(--text2); }
   .empty-ic svg { width: 26px; height: 26px; }
   .sh-bottom { border-top: .5px solid var(--line); }
-  .dest { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 14px 0 16px; font-size: 12px; color: var(--text2); }
-  .seg.sm button { height: 22px; padding: 0 10px; font-size: 11.5px; border-radius: 6px; }
-  .seg.sm { border-radius: 8px; }
   .sh-foot { display: flex; gap: 8px; padding: 10px 12px 6px; }
   .sh-foot .btn { height: 38px; border-radius: 11px; font-size: 13.5px; padding: 0 14px; }
   .sh-foot .primary { flex: 1; }
@@ -2311,7 +2339,8 @@
     pointer-events: none; opacity: 0; transform: translate(-50%, 16px) scale(.97); transition: opacity .2s, transform .45s var(--ease);
   }
   .toast.on { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
-  .toast:has(button:not([hidden])) { padding-right: 6px; }
+  .toast:has(.t-acts button) { padding-right: 6px; }
+  .t-acts { display: flex; gap: 2px; }
   .t-ic { color: var(--green); margin-left: -4px; }
   .t-ic svg { width: 18px; height: 18px; }
   .toast.error .t-ic { color: var(--red); }
