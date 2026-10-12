@@ -336,7 +336,7 @@
   const pick = { base: null, el: null, trail: [], drag: null, raf: 0 };
 
   function startPicking() {
-    if (mode === 'composing') return $.input.focus();
+    if (mode === 'composing') return focusComposer();
     if (mode !== 'idle') return;
     closeSheet();
     closeLightbox();
@@ -622,7 +622,14 @@
     if (IS_TOP) return captureFrom(p);
     mode = 'idle';
     cleanupPicking();
+    releaseFocus();
     toParent({ type: 'capture', ...p, frameUrl: frameKey(), bounds: viewportBounds() });
+  }
+
+  // Let the top frame's composer have the keyboard (blurs e.g. the app's input).
+  function releaseFocus() {
+    const active = document.activeElement;
+    if (active && active !== document.body) active.blur?.();
   }
 
   // Top frame: `rect` and `bounds` (the visible part of the frame chain) are in
@@ -778,8 +785,9 @@
     $.veil.classList.add('on');
     $.cmp.classList.add('on');
     placeComposer(true);
-    $.input.focus({ preventScroll: true });
+    focusComposer();
     $.input.setSelectionRange($.input.value.length, $.input.value.length);
+    toFrames({ type: 'frame:composing', on: true });
     render();
 
     // Follow the page if it scrolls underneath (fixed elements stay put).
@@ -852,7 +860,19 @@
     closeComposer();
   }
 
+  // Focus may still sit in an iframe (the app you were clicking around in), and
+  // Chrome doesn't always hand it over on the first ask. Ask until it sticks.
+  function focusComposer(tries = 5) {
+    if (!composer) return;
+    if (!document.hasFocus()) window.focus();
+    $.input.focus({ preventScroll: true });
+    if (tries && (!document.hasFocus() || root.activeElement !== $.input)) {
+      setTimeout(() => focusComposer(tries - 1), 60);
+    }
+  }
+
   function closeComposer() {
+    if (composer) toFrames({ type: 'frame:composing', on: false });
     composerAbort?.abort();
     $.spot.classList.remove('on');
     $.veil.classList.remove('on');
@@ -1527,6 +1547,16 @@
   // until it reaches the top frame. Commands go back down through the worker.
 
   const childAgents = new Set(); // <iframe>s whose document runs Redline
+  let topComposing = false; // child frames: the top frame's composer is open
+
+  // Esc pressed in a child frame while the composer is open cancels it, even
+  // from one of the page's own fields, instead of reaching the page.
+  function onComposingKey(e) {
+    if (IS_TOP || !topComposing || e.key !== 'Escape') return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    toParent({ type: 'esc' });
+  }
 
   const viewportBounds = () => ({ x: 0, y: 0, w: innerWidth, h: innerHeight });
   const shift = (r, o) => r && { ...r, x: r.x + o.x, y: r.y + o.y };
@@ -1640,6 +1670,10 @@
       case 'frame:snap':
         if (msg.hidden) stopPicking();
         return setHidden(msg.hidden);
+      case 'frame:composing':
+        topComposing = !!msg.on;
+        if (topComposing) releaseFocus();
+        return;
       case 'frame:show': {
         const item = session?.items.find((i) => i.id === msg.id);
         if (item?.frameUrl === frameKey()) showItem(item);
@@ -1701,6 +1735,7 @@
   on(window, 'pointerout', (e) => !e.relatedTarget && (pointer.x = pointer.y = -1), { passive: true, capture: true });
   on(window, 'message', onFrameMessage);
   on(window, 'keydown', onIdleEscape);
+  on(window, 'keydown', onComposingKey, { capture: true });
   if (!IS_TOP) toParent({ type: 'hello' });
   pingChildren();
   on(window, 'resize', () => pinEls.size && renderPins(), { passive: true });
