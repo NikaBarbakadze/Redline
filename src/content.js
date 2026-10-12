@@ -25,6 +25,7 @@
   let sheetView = 'current'; // current | history | entry
   let history = null; // History summaries, newest first (loaded when the sheet opens)
   let entry = null; // the archived session open in the sheet
+  let uiHidden = false; // Esc tucked the dock and pins away (all tabs) until the next capture
   let shortcutLabel = isMac ? '⌘⇧S' : 'Ctrl+Shift+S';
   let myTabId = null;
   const pointer = { x: -1, y: -1 };
@@ -72,9 +73,17 @@
   }
 
   function onStorage(changes, area) {
-    if (area !== 'local' || !(KEY in changes)) return;
-    session = changes[KEY].newValue ?? null;
+    if (area !== 'local' || !(KEY in changes || 'uiHidden' in changes)) return;
+    if (KEY in changes) session = changes[KEY].newValue ?? null;
+    if ('uiHidden' in changes) uiHidden = !!changes.uiHidden.newValue;
     render();
+  }
+
+  function setUiHidden(hidden) {
+    if (uiHidden === hidden) return;
+    uiHidden = hidden;
+    render();
+    chrome.storage.local.set({ uiHidden: hidden }).catch(() => {});
   }
 
   // -------------------------------------------------------------------------
@@ -332,6 +341,7 @@
     closeSheet();
     closeLightbox();
     mode = 'picking';
+    if (IS_TOP) setUiHidden(false);
     ensureUI();
     raise();
     if (IS_TOP) {
@@ -1048,6 +1058,7 @@
     if (mode !== 'idle') return;
     sheetOpen = true;
     sheetView = view;
+    setUiHidden(false);
     ensureUI();
     raise();
     render();
@@ -1056,14 +1067,39 @@
     on(window, 'keydown', onSheetKey, { capture: true });
   }
 
+  // Esc that nothing else claimed (no picker, composer or panel open; not typed
+  // into a field; not handled by the page). Child frames pass it to the top.
+  function onIdleEscape(e) {
+    if (e.key !== 'Escape' || e.defaultPrevented || e.repeat || e.isComposing) return;
+    const t = e.composedPath()[0];
+    if (t?.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t?.tagName)) return;
+    if (!IS_TOP) return mode === 'idle' && toParent({ type: 'esc' });
+    escape();
+  }
+
+  function escape() {
+    if (lightboxOpen) closeLightbox();
+    else if (sheetOpen && sheetView === 'entry') setSheetView('history');
+    else if (sheetOpen) closeSheet();
+    else if (mode === 'composing') dismissComposer();
+    else if (mode === 'picking') stopPicking();
+    else if (mode === 'idle' && session?.items?.length && !uiHidden) hideSession();
+  }
+
+  async function hideSession() {
+    setUiHidden(true);
+    const { hidHint } = await chrome.storage.local.get('hidHint');
+    if (hidHint) return;
+    chrome.storage.local.set({ hidHint: true });
+    toast('Notes hidden. They come back on your next capture.', { action: 'Show', onAction: () => setUiHidden(false) });
+  }
+
   function onSheetKey(e) {
     if (!sheetOpen) return;
     if (e.key !== 'Escape') return;
     e.preventDefault();
     e.stopImmediatePropagation();
-    if (lightboxOpen) closeLightbox();
-    else if (sheetView === 'entry') setSheetView('history');
-    else closeSheet();
+    escape();
   }
 
   function closeSheet() {
@@ -1370,7 +1406,7 @@
     const items = session?.items ?? [];
     if (IS_TOP && (host || items.length || mode !== 'idle' || sheetOpen)) {
       ensureUI();
-      const showDock = items.length > 0 && mode === 'idle' && !sheetOpen;
+      const showDock = items.length > 0 && mode === 'idle' && !sheetOpen && !uiHidden;
       $.dock.classList.toggle('on', showDock);
       $.dockCount.textContent = items.length;
       $.dockLabel.textContent = items.length === 1 ? 'note' : 'notes';
@@ -1378,6 +1414,7 @@
     }
     renderPins();
     pinsLayer?.classList.toggle('busy', mode !== 'idle' || sheetOpen);
+    pinsLayer?.classList.toggle('gone', uiHidden && mode === 'idle' && !sheetOpen);
   }
 
   function bumpDock() {
@@ -1582,7 +1619,8 @@
   }
 
   function fromChild(m) {
-    if (m.type === 'capture') captureFrom(m);
+    if (m.type === 'esc') escape();
+    else if (m.type === 'capture') captureFrom(m);
     else if (m.type === 'edit' && mode === 'idle') editFromFrame(m);
   }
 
@@ -1662,6 +1700,7 @@
   on(window, 'pointermove', (e) => ((pointer.x = e.clientX), (pointer.y = e.clientY)), { passive: true, capture: true });
   on(window, 'pointerout', (e) => !e.relatedTarget && (pointer.x = pointer.y = -1), { passive: true, capture: true });
   on(window, 'message', onFrameMessage);
+  on(window, 'keydown', onIdleEscape);
   if (!IS_TOP) toParent({ type: 'hello' });
   pingChildren();
   on(window, 'resize', () => pinEls.size && renderPins(), { passive: true });
@@ -1681,8 +1720,9 @@
   chrome.runtime.onMessage.addListener(onMessage);
   chrome.storage.onChanged.addListener(onStorage);
   chrome.tabs?.getCurrent?.((tab) => (myTabId = tab?.id ?? null));
-  readSession().then((s) => {
-    session = s;
+  chrome.storage.local.get([KEY, 'uiHidden']).then((stored) => {
+    session = stored[KEY] ?? null;
+    uiHidden = !!stored.uiHidden;
     render();
   });
 
@@ -2108,6 +2148,8 @@
   .p.fixed { position: fixed; }
   .p:hover { transform: scale(1.14); }
   .layer.picking .p { pointer-events: none; opacity: .55; }
+  .p { transition: transform .25s cubic-bezier(.34,1.4,.64,1), opacity .2s; }
+  .layer.gone .p { opacity: 0; pointer-events: none; transform: scale(.6); }
   .p.pulse { animation: pulse 1.1s ease-out; }
   @keyframes pop { from { transform: scale(0); } }
   @keyframes pulse { 0% { box-shadow: 0 0 0 2px #fff, 0 0 0 2px rgba(255,59,48,.6); } 100% { box-shadow: 0 0 0 2px #fff, 0 0 0 22px rgba(255,59,48,0); } }

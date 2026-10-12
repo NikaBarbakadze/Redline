@@ -29,6 +29,7 @@ The welcome page that opens shows your shortcut and has a card to practice on.
 | <kbd>⌘</kbd><kbd>↵</kbd> | Save and capture the next one |
 | <kbd>⇧</kbd><kbd>↵</kbd> | New line |
 | <kbd>esc</kbd> | Cancel (twice if you've typed something) |
+| <kbd>esc</kbd> with nothing open | Hide the dock and pins until your next capture |
 
 - Hover states stay live while picking, so open menus, tooltips and modals (including native `<dialog>`s) can be captured.
 - Works inside iframes, including cross-origin ones like an embedded app in Shopify admin or the theme editor preview. The note records the iframe's URL (path only, so session tokens stay out) and the element path inside it.
