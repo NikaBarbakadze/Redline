@@ -85,7 +85,7 @@
   function onStorage(changes, area) {
     if (area !== 'local') return;
     if ('lastCopy' in changes) lastCopy = changes.lastCopy.newValue ?? null;
-    if ('panel' in changes) syncPanel(changes.panel.newValue);
+    if ('panel' in changes) (panelOpen = !!changes.panel.newValue?.open), syncPanel(changes.panel.newValue);
     if (!(KEY in changes || 'uiHidden' in changes)) return;
     if (KEY in changes) session = changes[KEY].newValue ?? null;
     if ('uiHidden' in changes) uiHidden = !!changes.uiHidden.newValue;
@@ -1300,6 +1300,41 @@
     else if (panel.view && panel.view !== sheetView && sheetView !== 'entry') setSheetView(panel.view, { sync: false });
   }
 
+  // Clicking anywhere outside the panel closes it, like Esc; the click still
+  // reaches the page. A child frame can't see the panel, so it relays its clicks
+  // up while the panel is open.
+  let panelOpen = false; // child frames: the panel is open up top
+
+  function onPointerDown(e) {
+    if (e.button !== 0 || !(IS_TOP ? sheetOpen : panelOpen) || onScrollbar(e)) return;
+    if (!IS_TOP) return void (mode === 'idle' && toParent({ type: 'outside' }));
+    if (!host || !e.composedPath().includes(host)) outsideClick();
+  }
+
+  function outsideClick() {
+    if (sheetOpen && mode === 'idle' && !lightboxOpen) closeSheet();
+  }
+
+  // Dragging a scrollbar scrolls; it isn't a click on the page. Classic
+  // scrollbars sit outside clientWidth/Height. Overlay ones (macOS) cover the
+  // scroller's last few pixels, and Chrome targets the scroller itself.
+  const OVERLAY_BAR = 16;
+
+  function onScrollbar(e) {
+    const page = document.scrollingElement ?? document.documentElement; // <body> in quirks mode
+    if (e.clientX >= page.clientWidth || e.clientY >= page.clientHeight) return true;
+    const t = e.target;
+    if (!(t instanceof Element)) return false;
+    const root = t === page || t === document.documentElement;
+    if (!root && !/auto|scroll|overlay/.test(getComputedStyle(t).overflow)) return false;
+    const el = root ? page : t;
+    const [x, y] = root ? [e.clientX, e.clientY] : [e.offsetX, e.offsetY];
+    return (
+      (el.scrollHeight > el.clientHeight && x >= el.clientWidth - OVERLAY_BAR) ||
+      (el.scrollWidth > el.clientWidth && y >= el.clientHeight - OVERLAY_BAR)
+    );
+  }
+
   // -------------------------------------------------------------------------
   // Keys. This script runs at document_start, so these capture listeners are
   // registered before any of the page's own: sites (and other extensions) that
@@ -1850,6 +1885,7 @@
 
   function fromChild(m) {
     if (m.type === 'esc') escape();
+    else if (m.type === 'outside') outsideClick();
     else if (m.type === 'capture') captureFrom(m);
     else if (m.type === 'edit' && mode === 'idle') editFromFrame(m);
   }
@@ -1935,6 +1971,7 @@
   on(window, 'keyup', onKeyUp, { capture: true });
   on(window, 'paste', onPaste, { capture: true });
   on(window, 'keydown', idleEscape);
+  on(window, 'pointerdown', onPointerDown, { passive: true, capture: true });
   on(window, 'pointermove', (e) => ((pointer.x = e.clientX), (pointer.y = e.clientY)), { passive: true, capture: true });
   on(window, 'pointerout', (e) => !e.relatedTarget && (pointer.x = pointer.y = -1), { passive: true, capture: true });
   on(window, 'message', onFrameMessage);
@@ -1967,6 +2004,7 @@
   Promise.all([chrome.storage.local.get([KEY, 'uiHidden', 'panel']), domReady]).then(([stored]) => {
     session = stored[KEY] ?? null;
     uiHidden = !!stored.uiHidden;
+    panelOpen = !!stored.panel?.open;
     pingChildren();
     render();
     if (stored.panel?.open) syncPanel(stored.panel); // the panel follows you to new pages too

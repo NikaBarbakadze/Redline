@@ -73,7 +73,7 @@ Press <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd>, pick something, write a note and
 
 On Windows and Linux, use <kbd>Ctrl</kbd> wherever you see <kbd>⌘</kbd>.
 
-**The dock** in the corner shows how many notes you have and has **Copy notes**. Click the count (or the toolbar icon) to open the **notes panel**, where you can edit notes inline, zoom screenshots, copy a single screenshot, jump back to a note's element on the page, or delete a note (with undo). The panel follows you across tabs.
+**The dock** in the corner shows how many notes you have and has **Copy notes**. Click the count (or the toolbar icon) to open the **notes panel**, where you can edit notes inline, zoom screenshots, copy a single screenshot, jump back to a note's element on the page, or delete a note (with undo). Click anywhere outside it, or press <kbd>esc</kbd>, to close it. The panel follows you across tabs.
 
 **Sessions.** Copying closes the session. It moves to History and your next note starts again at 1, so batches never mix. Copied too early? **Keep adding** in the confirmation toast reopens it. **History** (the second tab in the panel, or right-click the toolbar icon) keeps your last 50 sessions. Open one to copy it again or **Continue** it.
 

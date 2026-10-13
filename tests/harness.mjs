@@ -28,7 +28,7 @@ export function serve(port = 4818) {
   return new Promise((r) => server.listen(port, () => r(server)));
 }
 
-export async function launch({ dark = false, width = 1280, height = 800, args = [] } = {}) {
+export async function launch({ dark = false, width = 1280, height = 800, args = [], scrollbars = false } = {}) {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'redline-test-'));
   const downloads = path.join(tmp, 'downloads');
   fs.mkdirSync(path.join(tmp, 'profile', 'Default'), { recursive: true });
@@ -43,6 +43,7 @@ export async function launch({ dark = false, width = 1280, height = 800, args = 
     deviceScaleFactor: 2,
     colorScheme: dark ? 'dark' : 'light',
     args: [`--disable-extensions-except=${EXT}`, `--load-extension=${EXT}`, ...args],
+    ...(scrollbars && { ignoreDefaultArgs: ['--hide-scrollbars'] }), // headless hides them otherwise
   });
   const close = context.close.bind(context);
   context.close = async () => {

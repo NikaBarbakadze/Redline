@@ -13,6 +13,7 @@ const suites = [
   ['reload.mjs'],
   ['history.mjs'],
   ['panel-sync.mjs'],
+  ['panel-outside.mjs'],
   ['paste-anywhere.mjs'],
   ['esc-hide.mjs'],
   ['esc-after-buttons.mjs'],
