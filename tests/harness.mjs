@@ -62,13 +62,21 @@ export async function launch({ dark = false, width = 1280, height = 800, args = 
   return { context, sw, page, downloads };
 }
 
-// What the toolbar icon / ⌘⇧S do. (No page.bringToFront(): in headless it
-// breaks pointer routing into out-of-process iframes.)
-export async function toggle(sw, page) {
-  await sw.evaluate(async (url) => {
-    const tab = (await chrome.tabs.query({})).find((t) => t.url === url);
-    await chrome.tabs.sendMessage(tab.id, { type: 'toggle', target: 'page' }, { frameId: 0 });
-  }, page.url());
+// What ⌘⇧S does. (No page.bringToFront(): in headless it breaks pointer
+// routing into out-of-process iframes.)
+export const toggle = (sw, page) => tell(sw, page, 'toggle');
+
+// What the toolbar icon does: open or close the notes panel.
+export const icon = (sw, page) => tell(sw, page, 'panel');
+
+async function tell(sw, page, type) {
+  await sw.evaluate(
+    async ([url, type]) => {
+      const tab = (await chrome.tabs.query({})).find((t) => t.url === url);
+      await chrome.tabs.sendMessage(tab.id, { type, target: 'page' }, { frameId: 0 });
+    },
+    [page.url(), type],
+  );
   await page.waitForTimeout(150);
 }
 

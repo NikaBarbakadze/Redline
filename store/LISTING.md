@@ -30,7 +30,7 @@ It replaces the loop of screenshot → switch to the chat → paste → describe
 
 Private by design: no accounts, no servers, no analytics. Notes and screenshots stay on your computer.
 
-Shortcut: ⌘⇧S (Ctrl+Shift+S on Windows and Linux), or click the toolbar icon.
+Shortcut: ⌘⇧S (Ctrl+Shift+S on Windows and Linux). The toolbar icon opens your notes.
 
 Open source (MIT): https://github.com/NikaBarbakadze/Redline
 ```
@@ -64,7 +64,7 @@ Capture review notes on web pages: the user picks an element or area on the page
 | downloads.ui | Hides the download bubble while those PNGs are saved, so copying notes doesn't flash a download for every screenshot. |
 | clipboardWrite | Copies the notes prompt (and a single screenshot, on request) to the clipboard. |
 | offscreen | Clipboard fallback: an offscreen document writes the prompt when the page the user is on can't. |
-| contextMenus | The right-click menu on the toolbar icon: Review notes, History, Copy notes, Start a new session, Change keyboard shortcut. |
+| contextMenus | The right-click menu on the toolbar icon: Capture, History, Copy notes, Start a new session, Change keyboard shortcut. |
 | Host permission (all sites) | Users review whatever site they're working on, so the picker has to run on any page and inside its iframes (for example apps embedded in an admin). It runs at document start in every frame so its keyboard shortcuts (Esc, Enter, arrows) work even on pages that handle those keys themselves. Nothing is read or sent anywhere unless the user captures something, and captures stay on the device. |
 
 **Remote code:** No, I am not using remote code.
@@ -80,5 +80,5 @@ Capture review notes on web pages: the user picks an element or area on the page
 ## Test instructions (optional, for the reviewer)
 
 ```
-No account or setup needed. On any web page press ⌘⇧S (Ctrl+Shift+S) or click the toolbar icon, click an element, type a note and press Enter. Click "Copy notes" in the dock at the bottom right, then paste into any text field.
+No account or setup needed. On any web page press ⌘⇧S (Ctrl+Shift+S), click an element, type a note and press Enter. Click "Copy notes" in the dock at the bottom right, then paste into any text field.
 ```

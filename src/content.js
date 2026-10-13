@@ -1898,8 +1898,9 @@
         if (mode === 'picking') stopPicking();
         else startPicking();
         break;
-      case 'review':
-        openSheet();
+      case 'panel':
+        if (sheetOpen) closeSheet();
+        else openSheet();
         break;
       case 'history':
         openSheet('history');

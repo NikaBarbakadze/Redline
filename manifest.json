@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Redline",
   "short_name": "Redline",
-  "version": "1.5.1",
+  "version": "1.6.0",
   "description": "Point at anything on a web page, say what should change, and hand the whole batch to your coding agent.",
   "minimum_chrome_version": "123",
   "icons": {
@@ -12,7 +12,7 @@
     "128": "icons/128.png"
   },
   "action": {
-    "default_title": "Redline — capture (⌘⇧S)",
+    "default_title": "Redline — notes",
     "default_icon": {
       "16": "icons/16.png",
       "32": "icons/32.png"

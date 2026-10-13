@@ -55,11 +55,12 @@ A welcome page opens with your shortcut and a card to practice on. If <kbd>⌘</
 
 ## Usage
 
-Press <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> or click the toolbar icon, pick something, write a note and press <kbd>↵</kbd>. Repeat. When you're done, click **Copy notes** in the dock and paste.
+Press <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd>, pick something, write a note and press <kbd>↵</kbd>. Repeat. When you're done, click **Copy notes** in the dock and paste.
 
 | Key | Action |
 |---|---|
-| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> or the toolbar icon | Start capturing |
+| <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> | Start capturing |
+| The toolbar icon | Open or close the notes panel |
 | Click | Capture the highlighted element |
 | Drag | Capture an area |
 | <kbd>Space</kbd> | Capture the whole visible screen |
@@ -72,7 +73,7 @@ Press <kbd>⌘</kbd><kbd>⇧</kbd><kbd>S</kbd> or click the toolbar icon, pick s
 
 On Windows and Linux, use <kbd>Ctrl</kbd> wherever you see <kbd>⌘</kbd>.
 
-**The dock** in the corner shows how many notes you have and has **Copy notes**. Click the count to open the **notes panel**, where you can edit notes inline, zoom screenshots, copy a single screenshot, jump back to a note's element on the page, or delete a note (with undo). The panel follows you across tabs.
+**The dock** in the corner shows how many notes you have and has **Copy notes**. Click the count (or the toolbar icon) to open the **notes panel**, where you can edit notes inline, zoom screenshots, copy a single screenshot, jump back to a note's element on the page, or delete a note (with undo). The panel follows you across tabs.
 
 **Sessions.** Copying closes the session. It moves to History and your next note starts again at 1, so batches never mix. Copied too early? **Keep adding** in the confirmation toast reopens it. **History** (the second tab in the panel, or right-click the toolbar icon) keeps your last 50 sessions. Open one to copy it again or **Continue** it.
 
@@ -121,7 +122,7 @@ Redline has no backend and makes no network requests ([privacy policy](PRIVACY.m
 | `storage`, `unlimitedStorage` | Keep the current session, and keep screenshots and History in IndexedDB without hitting the default quota. |
 | `downloads`, `downloads.ui` | Save the screenshots as PNGs without the download bubble, then clear their rows from the downloads list. |
 | `clipboardWrite`, `offscreen` | Copy the prompt, with an offscreen document as a fallback when the page can't write to the clipboard. |
-| `contextMenus` | The right-click menu on the toolbar icon (Review, History, Copy, New session, Change shortcut). |
+| `contextMenus` | The right-click menu on the toolbar icon (Capture, History, Copy, New session, Change shortcut). |
 
 ## How it works
 

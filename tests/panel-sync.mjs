@@ -1,6 +1,7 @@
 // The notes panel is one panel across tabs: it follows you to the next tab and
-// closing it anywhere (Esc or ×) closes it everywhere.
-import { run, check, note, ui, hasClass } from './harness.mjs';
+// closing it anywhere (Esc or ×) closes it everywhere. The toolbar icon opens
+// and closes it.
+import { run, check, note, toggle, icon, ui, hasClass } from './harness.mjs';
 
 await run('Panel follows you across tabs', async ({ context, sw, page: a }) => {
   const open = (p) => hasClass(ui(p, '.sheet'), 'on');
@@ -41,4 +42,22 @@ await run('Panel follows you across tabs', async ({ context, sw, page: a }) => {
   await a.reload();
   await a.waitForTimeout(800);
   check('a closed panel stays closed on new pages', !(await open(a).catch(() => false)));
+
+  const picking = () => hasClass(ui(a, '.hud'), 'on');
+  await icon(sw, a);
+  await a.waitForTimeout(500);
+  check('the toolbar icon opens the notes panel', await open(a));
+  check('…on Current, with the note', (await ui(a, '[data-ref=sheetTitle]').textContent()) === 'Notes' && (await ui(a, '[data-ref=list] > .card').count()) === 1);
+  check('…without starting a capture', !(await picking()));
+  await icon(sw, a);
+  await a.waitForTimeout(500);
+  check('clicking it again closes the panel', !(await open(a)));
+
+  await toggle(sw, a);
+  await a.mouse.move(400, 300);
+  await a.waitForTimeout(200);
+  const wasPicking = await picking();
+  await icon(sw, a);
+  await a.waitForTimeout(500);
+  check('mid-capture, the icon stops picking and opens the panel', wasPicking && !(await picking()) && (await open(a)));
 });

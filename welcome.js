@@ -16,7 +16,7 @@ async function showShortcut() {
   );
   label.textContent = shortcut ? 'Capture anywhere with' : 'No shortcut set yet.';
   label.classList.toggle('missing', !shortcut);
-  inline.textContent = shortcut || 'the toolbar icon';
+  inline.textContent = shortcut || 'the shortcut (set one above)';
 }
 
 document.getElementById('change').addEventListener('click', () => {

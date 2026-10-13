@@ -524,7 +524,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // ---------------------------------------------------------------------------
 // Entry points
 
-chrome.action.onClicked.addListener((tab) => tellTab(tab, { type: 'toggle' }));
+// The icon opens (or closes) the notes panel; ⌘⇧S and the panel's own button capture.
+chrome.action.onClicked.addListener((tab) => tellTab(tab, { type: 'panel' }));
 
 chrome.commands.onCommand.addListener(async (command, tab) => {
   if (command === 'capture') tellTab(tab ?? (await activeTab()), { type: 'toggle' });
@@ -533,8 +534,8 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   tab ??= await activeTab();
   switch (info.menuItemId) {
-    case 'review':
-      return tellTab(tab, { type: 'review' });
+    case 'capture':
+      return tellTab(tab, { type: 'toggle' });
     case 'history':
       return tellTab(tab, { type: 'history' });
     case 'copy':
@@ -560,7 +561,7 @@ chrome.storage.onChanged.addListener((changes, area) => {
 chrome.runtime.onInstalled.addListener(({ reason }) => {
   chrome.contextMenus.removeAll(() => {
     const menu = [
-      ['review', 'Review notes'],
+      ['capture', 'Capture'],
       ['history', 'History'],
       ['copy', 'Copy notes'],
       ['clear', 'Start a new session'],
