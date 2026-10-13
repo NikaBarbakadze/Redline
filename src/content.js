@@ -33,7 +33,7 @@
   let sheetView = 'current'; // current | history | entry
   let history = null; // History summaries, newest first (loaded when the sheet opens)
   let entry = null; // the archived session open in the sheet
-  let uiHidden = false; // Esc tucked the dock away (all tabs) until the next capture
+  let uiHidden = false; // Esc or closing the panel tucked the dock away (all tabs) until the next capture
   let lastCopy = null; // { id, hash, at }: the last text Redline copied (see onPaste)
   let plainNext = 0; // ⇧⌘V was pressed: leave the next paste alone until this time
   let shortcutLabel = isMac ? '⌘⇧S' : 'Ctrl+Shift+S';
@@ -315,7 +315,7 @@
       removeItem(id);
     },
     review: () => openSheet(),
-    close: () => closeSheet(),
+    close: () => dismissSheet(),
     copy: (e) => copyAll(e.target.closest('button')),
     copyEntry: (e) => copyAll(e.target.closest('button'), entry?.id),
     copyImage: (e) => copyImage(e.target.closest('.card')),
@@ -1312,7 +1312,7 @@
   }
 
   function outsideClick() {
-    if (sheetOpen && mode === 'idle' && !lightboxOpen) closeSheet();
+    if (sheetOpen && mode === 'idle' && !lightboxOpen) dismissSheet();
   }
 
   // Dragging a scrollbar scrolls; it isn't a click on the page. Classic
@@ -1418,7 +1418,7 @@
   function escape() {
     if (lightboxOpen) closeLightbox();
     else if (sheetOpen && sheetView === 'entry') setSheetView('history');
-    else if (sheetOpen) closeSheet();
+    else if (sheetOpen) dismissSheet();
     else if (mode === 'composing') dismissComposer();
     else if (mode === 'picking') stopPicking();
     else if (mode === 'idle' && session?.items?.length && !uiHidden) hideSession();
@@ -1430,6 +1430,13 @@
     if (hidHint) return;
     chrome.storage.local.set({ hidHint: true });
     toast('Notes hidden. They come back on your next capture.', { action: 'Show', onAction: () => setUiHidden(false) });
+  }
+
+  // Closing the panel yourself (×, Esc, a click outside, the toolbar icon) is
+  // one step: the dock stays tucked away too, until the next capture.
+  function dismissSheet() {
+    setUiHidden(true);
+    closeSheet();
   }
 
   function closeSheet({ sync = true } = {}) {
@@ -1935,7 +1942,7 @@
         else startPicking();
         break;
       case 'panel':
-        if (sheetOpen) closeSheet();
+        if (sheetOpen) dismissSheet();
         else openSheet();
         break;
       case 'history':

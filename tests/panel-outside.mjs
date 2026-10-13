@@ -68,6 +68,7 @@ await run('Clicking outside closes the panel', async ({ sw, page }) => {
   await page.evaluate(() => (window.clicks = []));
   await clickAt(t.x + 20, t.y + t.height / 2);
   check('a click on the page closes it', !(await open()));
+  check('…dock included', !(await hasClass(ui(page, '.dock'), 'on')));
   check('…and still reaches the page', (await page.evaluate(() => window.clicks)).includes('H1'));
   const saved = await sw.evaluate(async () => (await chrome.storage.local.get('session')).session.items[0].note);
   check('…and keeps an edit in progress', saved === 'Green CTA. Darker on hover.', saved);

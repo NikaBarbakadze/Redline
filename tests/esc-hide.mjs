@@ -1,6 +1,6 @@
 // Esc with nothing open hides the dock (all tabs, survives reload)
 // until the next capture; Esc in a field is left alone; Esc inside an iframe
-// closes the panel, then hides the session there too.
+// closes the panel (and the dock with it) and hides the session there too.
 import { run, check, toggle, note, ui, hasClass } from './harness.mjs';
 
 await run('Esc hides the session', async ({ sw, page }) => {
@@ -44,7 +44,14 @@ await run('Esc hides the session', async ({ sw, page }) => {
   await page.keyboard.press('Escape');
   await page.waitForTimeout(500);
   check('Esc with focus in an iframe closes the panel', !(await hasClass(ui(page, '.sheet'), 'on')));
+  check('…and the dock with it', !(await dock()));
+  await toggle(sw, page);
+  await page.keyboard.press('Escape'); // cancelled capture: the dock is back
+  await page.waitForTimeout(400);
+  await page.mouse.click(row.x + 22, row.y + 17);
+  await page.waitForTimeout(200);
+  const back = await dock();
   await page.keyboard.press('Escape');
   await page.waitForTimeout(500);
-  check('…and the next one hides the session', !(await dock()));
+  check('with the dock back, Esc in the iframe hides the session', back && !(await dock()));
 }, { width: 1440, height: 900 });

@@ -1,6 +1,6 @@
 // The notes panel is one panel across tabs: it follows you to the next tab and
-// closing it anywhere (Esc or ×) closes it everywhere. The toolbar icon opens
-// and closes it.
+// closing it anywhere (Esc or ×) closes it everywhere, the dock included. The
+// toolbar icon opens and closes it.
 import { run, check, note, toggle, icon, ui, hasClass } from './harness.mjs';
 
 await run('Panel follows you across tabs', async ({ context, sw, page: a }) => {
@@ -20,8 +20,9 @@ await run('Panel follows you across tabs', async ({ context, sw, page: a }) => {
   await b.waitForTimeout(500);
   check('Esc there closes it…', !(await open(b)));
   check('…and in the first tab too', !(await open(a)));
+  check('the dock stays away in both tabs', !(await hasClass(ui(b, '.dock'), 'on')) && !(await hasClass(ui(a, '.dock'), 'on')));
 
-  await ui(b, '.dock-notes').click();
+  await icon(sw, b);
   await b.waitForTimeout(600);
   await a.bringToFront();
   await a.waitForTimeout(800);
@@ -51,7 +52,7 @@ await run('Panel follows you across tabs', async ({ context, sw, page: a }) => {
   check('…without starting a capture', !(await picking()));
   await icon(sw, a);
   await a.waitForTimeout(500);
-  check('clicking it again closes the panel', !(await open(a)));
+  check('clicking it again closes the panel, dock included', !(await open(a)) && !(await hasClass(ui(a, '.dock'), 'on')));
 
   await toggle(sw, a);
   await a.mouse.move(400, 300);

@@ -24,6 +24,8 @@ await run('Esc after clicking Redline buttons', async ({ sw, page }) => {
   await page.waitForTimeout(600);
   await ui(page, '.sheet [data-act=close]').click();
   await page.waitForTimeout(500);
+  check('closing the panel with × tucks the dock away too', !(await dock()));
+  await reveal();
   await page.keyboard.press('Escape');
   await page.waitForTimeout(400);
   check('after closing the panel with ×', !(await dock()));

@@ -38,10 +38,14 @@ await run(`Esc on a page that swallows it (${variant})`, async ({ context, sw, p
   await page.waitForTimeout(500);
   await page.keyboard.press('Escape');
   await page.waitForTimeout(300);
-  check('closes the panel', !(await on('.sheet')));
+  check('closes the panel, dock included', !(await on('.sheet')) && !(await on('.dock')));
+  await toggle(sw, page);
+  await page.keyboard.press('Escape'); // cancelled capture: the dock is back
+  await page.waitForTimeout(300);
+  const back = await on('.dock');
   await page.keyboard.press('Escape');
   await page.waitForTimeout(300);
-  check('hides the dock', !(await on('.dock')));
+  check('hides the dock', back && !(await on('.dock')));
 
   await capture();
   await page.keyboard.type('Typed text');
